@@ -56,8 +56,7 @@ Video Demo: http://www.youtube.com/watch?v=cpMk7frOEho
 
 Use the menu entry, found at `Menu->System->Woofy`.
 
-Or type `woofy` in the terminal to see all the logging output, as your new SFS
-file and ISO files are being created.
+Or type `woofy` in the terminal to see all the logging output, as your new ISO file is created.
 
 Once the Woofy UI has loaded:
 
@@ -97,7 +96,11 @@ you must have both mksquashfs3 and mksquashfs4 installed to remaster successfull
 
 ## Changelog
 
-version 0.91 - http://www.murga-linux.com/puppy/viewtopic.php?p=641665#641665
+version 0.91
+
+- new method for deleting files, choose apps to remove from Xdialog checklist
+- files woofy_missing_libs.txt and woofy_deleted_files.txt saved to $WORKDIR
+- reverted Xdialog progress bars for SFS creation to normal rxvt window (faster)
 
 version 0.9
 
