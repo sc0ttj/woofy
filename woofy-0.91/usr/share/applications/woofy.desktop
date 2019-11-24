@@ -1,0 +1,13 @@
+[Desktop Entry]
+Categories=X-SetupUtility
+Comment=Woofy
+Encoding=UTF-8
+Exec=woofy
+Name=Woofy remaster tool
+Name[de]=Woofy - remaster Werkzeug
+Name[es]=Woofy - herramienta de remasterizar
+Name[ru]=Woofy - инструмент для ремастеринга
+GenericName=Woofy
+Icon=/usr/local/lib/X11/mini-icons/mini-ray.xpm
+Terminal=false
+Type=Application

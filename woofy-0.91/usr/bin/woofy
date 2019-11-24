@@ -1,0 +1,1526 @@
+#!/bin/bash
+## Woofy - another remaster script, for Puppy Linux... by sc0ttman
+## Thanks to lguleder, stu90, shinobar and jemimah
+## Do what you want with this script, no warranty provided ;)
+## needs gtkdialog, xdialog.. also for deb, rpm, xz: undeb;unrpm;tar,lzmadec,xzdec,  
+## includes modified: initrd_editor.sh, wmswitcher, defaults-changer
+#111229: added check for 3.* kernels, sets sfs version
+#120404: must run as root, runs sudo and in turn, askpass
+#120412 updated: deps in /usr/local/woofy, sync woofy update.. fixed: get_layout for non-ROX pups, mount_sfs.. added: wmswitcher..
+#120412 added: check_deps, GUI progress for mksquashfs.. fixed: building zdrv, rm handling..
+#120413 fixed: add_pkg dialog, unsquash after mount fail, in mount_sfs, theme_chooser GUI layout, suppress stderror, missinglibs.txt naming.. 
+#180712 allow user to remove files from the new ISO
+#200712 fixed making list of apps for removal, updates in cleanup (move MISSING_LIBS_TXT and SEARCH_RESULTS_TXT to WORKDIR)
+##TODO## <-- search for this to see what can be done next
+
+[ "`whoami`" != "root" ] && exec sudo -A ${0} ${@} #120404
+
+GTKDIALOG=`which gtkdialog4`
+[ ! "$GTKDIALOG" ] && GTKDIALOG=`which gtkdialog3`
+[ ! "$GTKDIALOG" ] && GTKDIALOG=`which gtkdialog2`
+[ ! "$GTKDIALOG" ] && GTKDIALOG=`which gtkdialog`
+export GTKDIALOG
+
+## set vars
+export VERSION="0.91"
+export NAME="my-custom-puppy" # the name of the iso file, and the  dir from which the new iso will be created
+export SUFFIX="" # appended to the new sfs name, after the version, like so: pup_420$SUFFIX.sfs
+export ISOFILE="Choose an iso file to edit" # the original iso file to be remastered
+export DELETE_LIST="Choose a file-list.txt" # the list of files to delete from the new iso
+export PKGDIR="/path/to/my-packages" # the dir containing all the packages to be added to the new iso
+export WORKDIR="/tmp" # the tmp working dir for extracting packages and creating symlinks, sfs and iso files
+export BASEDIR="${WORKDIR}/sfs-base" # the dir, containing all files from sfs, and packages, to be made into the sfs
+export NOSTART=0 # if error is found, this changes to 1, woofy doesn't run
+export ERRMSG='' # the default error message
+export MISSING_LIBS_TXT="${NAME}_missing_libs.txt" #120413 # filename only
+export SEARCH_RESULTS_TXT="${NAME}_deleted_files.txt" #filename only 
+## set functions
+set -a # export all functions
+
+# print error, run cleanup, close woofy
+make_file_list () { #180712
+	## creates a list ready for --checklist in Xdialog
+	## checks /usr/share/applications
+	## builds a list of only the commands (not including paths, rxvt -e stuff or options.. Eg: "vlc transmission mp")
+	gtkdialog-splash -bg green -placement center -icon /usr/local/lib/X11/pixmaps/drives24.png -text "Please wait... Building the list of programs to delete..." &
+	XPID=$!
+	FILE_LIST=""
+	for A in ${BASEDIR}/usr/share/applications/*
+	do
+		FILE="$(cat "$A" | grep ^Exec=)"
+		[ ! "$FILE" ] && continue
+		[ "$FILE" = "" ] && continue
+		[ "$FILE" = " " ] && continue
+		[ "$FILE" = "Exec=" ] && continue
+		#get only command for search: strip paths, options, rxvt stuff, .sh, -shell, _shell, -wrapper, _wrapper, -gtk, _gtk, -gui, _gui, 
+		if [ "$(echo "$FILE" | grep 'rxvt')" = "" ];then
+			FILE="${FILE##*/}" # paths
+			FILE="${FILE%% *}" # options
+			FILE="${FILE%%.sh*}" 
+			FILE="${FILE%%-gui*}" #200712
+			FILE="${FILE%%_gui*}" 
+			FILE="${FILE%%-gtk*}" 
+			FILE="${FILE%%_gtk*}" 
+			FILE="${FILE%%_shell*}" 
+			FILE="${FILE%%-shell*}" 
+			FILE="${FILE%%_wrapper*}" 
+			FILE="${FILE%%-wrapper*}" 
+		fi
+		FILE="${FILE/rxvt*-e /}"
+		if [ "$(echo "$FILE" | grep 'Exec=')" != "" ];then
+			FILE="${FILE/Exec=/}" #strip Exec=
+			[ "$(ls /usr/local/bin | grep $FILE)" != "" ] && [ "$(echo $FILE | grep ^default)" != "" ] && continue # skip /usr/local/bin/default* files
+			[ "$FILE_LIST" = "" ] && FILE_LIST="$FILE $FILE off " || FILE_LIST="$FILE_LIST $FILE $FILE off"
+		fi
+	done
+	export FILE_LIST
+	kill $XPID &>/dev/null
+}
+
+search_files () { #180712
+	DIR="" EXCLUDE="" SEARCH_QUERY="" SEARCH_RES="" LIST=""
+	rm /tmp/$SEARCH_RESULTS_TXT &>/dev/null
+	EXCLUDE_DIRS="${BASEDIR}/proc ${BASEDIR}/initrd ${BASEDIR}/lib/modules ${BASEDIR}/mnt /root/hard-drive ${BASEDIR}/root/home ${BASEDIR}/media"
+	SEARCH_QUERY="$1"
+	for DIR in $EXCLUDE_DIRS; do 
+		EXCLUDE="${EXCLUDE} -path ${DIR} -prune -o"
+	done
+	for F in $SEARCH_QUERY; do
+		SEARCH_RES="$(find ${BASEDIR}/${EXCLUDE} -iname ${F}* -print)"
+		if [ "$SEARCH_RES" != "" ];then
+			[ "$LIST" = "" ] && LIST="$SEARCH_RES" || LIST="$LIST
+$SEARCH_RES"
+		fi
+	done
+	echo "$LIST" > "/tmp/${SEARCH_RESULTS_TXT}"
+}
+
+error_msg () {
+	ERRORMSG="$1"
+	Xdialog --title "Woofy $VERSION" --msgbox "Error: $ERRORMSG" 0 0
+	cleanup_files
+	exit 1
+}
+
+# make sure all fields are valid
+check_settings (){
+	ISOFILENAME=`basename "$ISOFILE"` # filename and extension
+	ISOEXT=${ISOFILENAME##*.} # extension only
+	# check ISOFILE
+	[ ! -f "$ISOFILE" ] || [ "$ISOEXT" != "iso" ] && ERRMSG="ISO file '$ISOFILE' not found." && NOSTART=1
+	# check name
+	[ "${NAME}" = "" ] && ERRMSG="Choose a valid ISO filename." && NOSTART=1
+	# check work dir
+	[ "${WORKDIR}" = "" ] && ERRMSG="Choose working directory." && NOSTART=1
+	# if error found, tell user and exit
+	[ "$NOSTART" = 1 ] && error_msg "Correct the following and try again:\n\n $ERRMSG"
+}
+
+# usage: unmount_iso $ISOFILE ${WORKDIR}
+mount_iso () {
+	# make the mount dir
+	[ ! -d "/mnt/oldiso" ] && mkdir -p "/mnt/oldiso"
+	# mount the iso file to a fixed location
+	ln -s -f "$ISOFILE" "${WORKDIR}/old.iso"
+	mount -t iso9660 -o loop,ro "${WORKDIR}/old.iso" "/mnt/oldiso"
+	[ ! "$(ls -A /mnt/oldiso)" ] && error_msg "ISO file '$ISOFILE' could not be mounted"
+}
+	
+# if fails to unsquash, then tries to mount
+mount_sfs () {
+
+	# try to mount the SFS
+#	if [ ! "$(ls -A "${BASEDIR}")" ];then
+	echo "Mounting ${OLDSFSPATH} at ${BASEDIR}... Please wait.."
+	[ ! -d "${WORKDIR}/oldsfs" ] && mkdir "${WORKDIR}/oldsfs"
+	[ ! -d "${BASEDIR}" ] && mkdir -p "${BASEDIR}"
+	mount -t squashfs -o loop,ro  "${OLDSFSPATH}" "${WORKDIR}/oldsfs" 
+	echo ""
+	# if it exists, copy the contents of $OLDSFS to ${BASEDIR} 
+	[ "$(ls -A "${WORKDIR}/oldsfs")" ] && cp --preserve=all --remove-destination -f -r "${WORKDIR}/oldsfs/"* "${BASEDIR}" && echo "SFS contents now in ${BASEDIR}"
+#	fi
+	
+	if [ ! "$(ls -A "${BASEDIR}")" 2>/dev/null ];then #120413
+	  rmdir "${BASEDIR}"
+	  echo -e "Unpacking ${OLDSFSPATH}. Please wait...\n"
+	fi
+
+	# if BASEDIR empty, unpack the sfs file, using the default squashfs of host
+	[ ! -d "${BASEDIR}" ] && unsquashfs -d "${BASEDIR}" "${OLDSFSPATH}" | while read -n 50 LINE ; do
+			echo $LINE |egrep '[0-9]\%'| cut -f1 -d% |awk '{print $NF}'|grep -v '\.' ;done | \
+			Xdialog --title "Woofy ${VERSION}" --gauge "Extracting squashfs file. Please wait..." 0 0 2>/dev/null #120412
+
+	# if BASEDIR empty, try again if it failed, with sfs4
+	[ ! -d "${BASEDIR}" ] && unsquashfs4 -d "${BASEDIR}" "${OLDSFSPATH}" | while read -n 50 LINE ; do
+			echo $LINE |egrep '[0-9]\%'| cut -f1 -d% |awk '{print $NF}'|grep -v '\.' ;done | \
+			Xdialog --title "Woofy ${VERSION}" --gauge "Extracting squashfs4 file. Please wait..." 0 0 2>/dev/null #120412
+
+	# if BASEDIR empty, try again if it failed, with sfs3
+	[ ! -d "${BASEDIR}" ] && unsquashfs3 -d "${BASEDIR}" "${OLDSFSPATH}" | while read -n 50 LINE ; do
+			echo $LINE |egrep '[0-9]\%'| cut -f1 -d% |awk '{print $NF}'|grep -v '\.' ;done | \
+			Xdialog --title "Woofy ${VERSION}" --gauge "Extracting squashfs3 file. Please wait..." 0 0 2>/dev/null #120412
+	
+	# error check, if BASEDIR empty, error and quit
+	[ ! "$(ls -A ${BASEDIR})" 2>/dev/null ] && error_msg "SFS file '$(basename ${OLDSFSNAME})' could not be extracted."
+}
+
+# usage: unmount_iso ${WORKDIR}
+unmount_iso () {
+	# close rox, if necessary
+	rox -D "/mnt/oldiso" 2>/dev/null
+	# unmount the iso file
+	umount "/mnt/oldiso" 2>/dev/null
+	# remove the mount dir
+	rmdir -v "/mnt/oldiso"
+	# remove the symlinked file
+	rm -v -f "${WORKDIR}/old.iso"
+}
+
+# use as is
+unmount_sfs () {
+	# close rox, if necessary
+	rox -D "${WORKDIR}/oldsfs" 2>/dev/null
+	# unmount and remove the sfs mount point
+	[ -d "${WORKDIR}/oldsfs" ] && umount  "${WORKDIR}/oldsfs" 2>/dev/null
+	[ -d "${WORKDIR}/${BASEDIR}" ] && umount  "${WORKDIR}/${BASEDIR}" 2>/dev/null
+	# remove the sfs mount dir contents
+	[ -d "${WORKDIR}/oldsfs" ] && rm -f -r "${WORKDIR}/oldsfs/" 2>/dev/null
+	[ -d "${WORKDIR}/${BASEDIR}" ] && rm -f -r "${WORKDIR}/${BASEDIR}" 2>/dev/null
+}
+
+# delete files #180712 use while loop on file SEARCH_RESULTS_TXT
+delete_files () {
+	if [ -e "/tmp/${SEARCH_RESULTS_TXT}" ];then # if list given exists
+		# delete listed files from ${BASEDIR}
+		while read LINE; do  
+			[ ! "${LINE}" ] && echo "skipping..." && continue # skip blank or empty lines
+			[ "${LINE}" = "" ] && echo "skipping..." && continue # skip blank or empty lines
+			[ "${LINE}" = " " ] && echo "skipping..." && continue # skip blank or empty lines
+			[ "$(echo $LINE | grep $BASEDIR)" = "" ] && LINE="${BASEDIR}${LINE}" #make sure BASEDIR is added if needed
+			[ -f "${LINE}" ] && rm -f -v --one-file-system "${LINE}" # delete the file
+			if [ -d "${LINE}" ];then
+				rm -f -R -v --one-file-system "${LINE}" # delete the files inside
+			fi
+		done <"/tmp/${SEARCH_RESULTS_TXT}"
+		echo "Files listed in /tmp/${SEARCH_RESULTS_TXT} have been deleted..."
+	else
+		echo "Nothing to delete from ${BASEDIR}"
+	fi
+}
+
+# usage: add_pkg "${PKGDIR}" "${WORKDIR}" "${BASEDIR}"
+add_pkg () {
+	echo -e "Adding packages... Please wait.\n"
+	XPID=''
+	Xdialog --title "Woofy ${VERSION}" --no-buttons --infobox "Adding packages to '${NAME}'... Please wait." 0 0 99999 & #120413
+	XPID=$!
+	for i in "${PKGDIR}/"* ; do # for each file in the given package dir
+		# get filenames, and extensions, without paths
+		export FULLNAME=`basename "$i"` 	# filename and extension
+		export FILENAME=${FULLNAME%.*} 	# filename, no extension
+		export EXTENSION=${FULLNAME##*.} # extension only
+		# for each filetype returned
+		case "${EXTENSION}" in
+			deb)
+				undeb "$i" 2>/dev/null ;;
+			pet)
+				tar -xzvf "$i" -C "${WORKDIR}" 2>/dev/null ;;
+			*gz)
+				tar -xzvf "$i" -C "${WORKDIR}" 2>/dev/null ;;
+			rpm)
+				unrpm "$i" 2>/dev/null ;;
+			sfs)
+				# create a mount point
+				[ -d "${WORKDIR}/sfspkg" ] && rmdir -f "${WORKDIR}/sfspkg"
+				# unpack the sfs file, using the default squashfs of host
+				unsquashfs -d "${WORKDIR}/sfspkg" "$i"
+				# try again if it failed, with sfs4
+				[ ! -d "${WORKDIR}/sfspkg" ] && unsquashfs4 -d "${WORKDIR}/sfspkg" "$i"
+				# try again if it failed, with sfs3
+				[ ! -d "${WORKDIR}/sfspkg" ] && unsquashfs3 -d "${WORKDIR}/sfspkg" "$i"
+				# if totally failed to unsquash, try to mount it instead
+				if [ ! -d "${WORKDIR}/sfspkg" ];then
+					echo "$i totally failed to unsquash, try to mount it instead..."
+					mkdir "${WORKDIR}/sfspkg"
+					mount -t squashfs -o loop,ro  "$i" "${WORKDIR}/sfspkg"
+				fi
+				# copy all files inside the mounted sfs to ${BASEDIR}, keep *, to only folder contents are copied
+				cp --preserve=all --remove-destination -f -r "${WORKDIR}/sfspkg/"* "${BASEDIR}"
+				# unmount the sfs
+				umount "$i" 2>/dev/null #120412
+				# remove the sfspkg mount point and contents
+				rm -r "${WORKDIR}/sfspkg/"
+				;;
+			txz)
+				tar -Jxvf "$i" "${WORKDIR}" ;;
+			xz)
+				xz "$i" ;;
+			*)
+				echo "File format .${EXTENSION} not supported" ;;
+		esac
+		# remove the whole extension
+		export FILENAME=`echo "${FILENAME}" | sed 's|.tar||'`;
+		# copy extracted contents (only the stuff inside the extracted folders) from ${WORKDIR} into ${BASEDIR}
+		[ -d "${WORKDIR}/${FILENAME}/" ] && cp --preserve=all --remove-destination -f -r "${WORKDIR}/${FILENAME}/"* "${BASEDIR}" 2>/dev/null
+		# if pinstall was added, execute it inside the sfs BASEDIR 
+		if [ -x "${BASEDIR}/pinstall.sh" ]; then
+			echo "executing ${BASEDIR}/pinstall.sh"
+			chroot "${BASEDIR}" /pinstall.sh
+			rm "${BASEDIR}/pinstall.sh"
+		fi
+		# remove pet.spec files in ${BASEDIR}
+		rm -f "${BASEDIR}/"pet.specs 2>/dev/null 
+		rm -f "${BASEDIR}/"*.specs 2>/dev/null 
+		# remove the original extracted files
+		[ -d "${WORKDIR}/${FILENAME}" ] && rm -r "${WORKDIR}/${FILENAME}/"
+		echo -e "Done: Contents of ${FILENAME} copied into $(dirname ${BASEDIR})...\n"
+	done
+	kill $XPID #120413
+	# ask user to remove the ${PKGDIR}
+	REPLY=""
+	#Xdialog --title "Woofy $VERSION" --default-no --yesno "All packages extracted to ${BASEDIR}\n\nDelete the '${PKGDIR}' folder and its contents (Not recommended)?" 0 0
+	#REPLY=$?
+	# if reply was yes, delete ${PKGDIR} and its contents
+	#if [ "$REPLY" = 0 ];then
+	#	rm -r "${PKGDIR}/"
+	#fi
+}
+
+# 120412, thanks to jemimah for check_libs func, renamed here
+check_deps(){
+	 rm "/tmp/${MISSING_LIBS_TXT}" 2>/dev/null
+	 touch "/tmp/${MISSING_LIBS_TXT}"
+	 Xdialog  --no-buttons --title "Checking for missing shared libraries.  Please wait..." --tailbox "/tmp/${MISSING_LIBS_TXT}" 20 100 &
+	 X2PID=$!
+	 
+	 echo -n "" > "/tmp/${MISSING_LIBS_TXT}"
+	 #echo -n "" > /tmp/notmissinglibs0.txt
+	 #echo -n "" > /tmp/notusedlibs.txt
+
+	 find ${BASEDIR} -type f | 
+	 while read ONEFILE 
+	 do
+	  echo -n '.'
+	  ISANEXEC="`file --brief $ONEFILE | grep -E "LSB executable|shared object"`"
+	  if [ ! "$ISANEXEC" = "" ];then
+		NUMBYTESALL="`echo -n "$ONEFILE" | wc -c | tr -s " " | cut -f 2 -d " "`"
+		NUMBYTESHD=`echo -n "${BASEDIR}" | wc -c | tr -s " " | cut -f 2 -d " "`
+		NUMBYTESHD="`expr $NUMBYTESHD + 1`"
+		NEWROOTFILE="`echo -n "$ONEFILE" | cut -b $NUMBYTESHD-$NUMBYTESALL`"
+	   LDDRESULT="`chroot ${BASEDIR} ldd ${NEWROOTFILE}`" 
+
+	   MISSINGLIBS0=`echo "$LDDRESULT" | grep "not found" | cut -f 2 | cut -f 1 -d " "`
+	   MISSINGLIBS=''
+	   if [ ! "$MISSINGLIBS0" = "" ];then
+		for LIB in $MISSINGLIBS0 ; do
+			FOUND=`find ${BASEDIR}/lib ${BASEDIR}/opt ${BASEDIR}/usr -name "$LIB" 2>/dev/null`
+			if [ "$FOUND" = '' ] ; then
+				MISSINGLIBS="$LIB $MISSINGLIBS"
+			fi
+		done
+		if [ ! "$MISSINGLIBS" = "" ];then
+			echo "File $ONEFILE has these missing library files:" >> "/tmp/${MISSING_LIBS_TXT}"
+			echo " $MISSINGLIBS" >> "/tmp/${MISSING_LIBS_TXT}"
+		fi
+	   fi
+	  fi
+	 done
+	 kill $X2PID
+	 if [ -s "/tmp/${MISSING_LIBS_TXT}" ] ; then
+		cp "/tmp/${MISSING_LIBS_TXT}" "${HOME}/${MISSING_LIBS_TXT}"
+		echo "
+	
+	The list ABOVE are files or programs with missing libraries. 	This is probably important! 
+	You should probably quit Woofy now, then locate and add the libraries to:
+	
+	Package dir: ${PKGDIR}
+	
+	However, you can continue if you want, but make sure you know what you're doing!
+	Do you want to ignore these warnings and continue building '${NAME}'?" >> "${HOME}/${MISSING_LIBS_TXT}"
+		
+		REPLY=''
+		Xdialog --title "Woofy $VERSION - Missing Libraries" --ok-label "Yes" --cancel-label "No" --tailbox "${HOME}/${MISSING_LIBS_TXT}" 30 100
+		REPLY=$?
+		if [ "$REPLY" != 0 ];then
+			error_msg "Woofy will now exit. See ${HOME}/${MISSING_LIBS_TXT} to learn more."
+		fi
+		##TODO## maybe download files from repo here
+	fi
+}
+
+# usage: get_themes "${BASEDIR}"
+get_themes () {
+	echo -e "\nFinding themes..."
+
+	iconThemes=''
+	for iconTheme in `ls -1 "${BASEDIR}/usr/local/lib/X11/themes"`; do
+		if [ "`file ${BASEDIR}/usr/local/lib/X11/themes/${iconTheme} | grep directory`" != "" ]; then
+			export iconThemes="${iconThemes}<item>${iconTheme}</item>"
+		fi
+	done
+
+	jwmThemes=''
+	for jwmTheme in `ls -1 "${BASEDIR}/root/.jwm/themes" | grep jwmrc`; do
+		export jwmThemes="${jwmThemes}<item>${jwmTheme%%-jwmrc*}</item>"
+	done
+
+	# use this to search, and make a list of, the wallpapers found in the base sfs
+	#	for WALLPAPER in `ls -1 "${BASEDIR}/usr/share/backgrounds"`; do
+	#		export WALLPAPERS="${WALLPAPERS}<item>${WALLPAPER}</item>"
+	#	done
+
+	###for setting GTK theme ### 25/5/11
+	gtkThemes=''
+	for gtkTheme in `ls -1 "${BASEDIR}/usr/share/themes" | tr '\n' ' '`; do
+		if [ -e "${BASEDIR}/usr/share/themes/$gtkTheme/gtk-2.0"* ]; then #120413
+			export gtkThemes="${gtkThemes}<item>${gtkTheme}</item>"
+		fi
+	done
+
+	###for setting openbox theme### 25/5/11
+	obThemes=''
+	for obTheme in `ls -1 "${BASEDIR}/usr/share/themes" | tr '\n' ' '`; do
+		if [ -e "${BASEDIR}/usr/share/themes/$obTheme/openbox-3" ]; then
+			export obThemes="${obThemes}<item>${obTheme}</item>"
+		fi
+	done
+
+	### Fluxbox, IceWM, XFCE themes ??? ### 
+	
+	if [ -x "${BASEDIR}/usr/local/apps/ROX-Filer/AppRun" ];then #120412, also see line ~320, with 'ROX_ICONS_GUI'
+		ROX_ICONS_GUI='<frame Choose a desktop icon layout>
+		<vbox>
+		<radiobutton tooltip-text="The full set of around 20 program icons, which usually is the default for Puppy Linux">
+			<variable>fullicons</variable>
+			<label>All program icons</label>
+			<default>$RADIO1</default>
+		</radiobutton>
+		<radiobutton tooltip-text="Only icons for essential programs: file manager, terminal, browser, media player, text editor and drives">
+			<variable>minimalicons</variable>
+			<label>Minimal program icons</label>
+			<default>$RADIO2</default>
+		</radiobutton>
+		<radiobutton tooltip-text="Only drive icons">
+			<variable>noicons</variable>
+			<label>No program icons </label>
+			<default>$RADIO3</default>
+		</radiobutton>
+		<radiobutton tooltip-text="Do not change the icon layout already used in the ISO">
+			<variable>sameicons</variable>
+			<label>Default program icons</label>
+			<default>$RADIO4</default>
+		</radiobutton>
+		</vbox>
+	</frame>'
+	
+	else
+		ROX_ICONS_GUI=''
+	fi
+
+	export themeChooser='
+	<window title="Woofy '$VERSION' - Themes">
+
+		<vbox>
+			<frame>
+				<hbox homogeneous="true">
+					<text><label>Choose your preferred themes, layouts & wallpaper, and click the Save Themes button</label></text>
+				</hbox>
+			</frame>
+
+			<hbox>
+				<frame Choose your themes>
+					<hbox>
+						<text><label>Icons theme:</label></text>
+						<combobox width-request="180">
+						<variable>iconTheme</variable>
+						'${iconThemes}'
+						</combobox>
+					</hbox>
+					<hbox>
+						<text><label>JWM theme:</label></text>
+						<combobox width-request="180">
+						<variable>jwmTheme</variable>
+						'${jwmThemes}'
+						</combobox>
+					</hbox>
+					<hbox>
+						<text><label>GTK theme:</label></text>
+						<combobox width-request="180">
+						<variable>gtkTheme</variable>
+						'${gtkThemes}'
+						</combobox>
+					</hbox>
+					<hbox>
+						<text><label>Openbox theme:</label></text>
+						<combobox width-request="180">
+						<variable>obTheme</variable>
+						'${obThemes}'
+						</combobox>
+					</hbox>
+				</frame>
+			'$ROX_ICONS_GUI'
+			</hbox>
+
+			<frame Choose a wallpaper background image>
+				<hbox>
+					<text><label>Wallpaper image:</label></text>
+					<entry tooltip-text="Choose a nice new wallpaper image - jpg, png, etc">
+						<default>"'${WALLPAPER}'"</default>
+						<variable>WALLPAPER</variable>
+					</entry>
+					<button>
+						<input file icon="gtk-file"></input>
+						<action type="fileselect">WALLPAPER</action>
+					</button>
+				</hbox>
+			</frame>
+
+			<frame>
+				<hbox>
+					<button>
+						<input file icon="gtk-save"></input>
+						<label>Save Themes</label>
+						<action>set_themes "${iconTheme}" "${jwmTheme}" "${WALLPAPER}" "${gtkTheme}" "${BASEDIR}"</action>
+						<action type="exit">EXIT_NOW</action>
+					</button>
+					<button>
+						<input file stock="gtk-cancel"></input>
+						<label>Cancel</label>
+						<action type="exit">EXIT_NOW</action>
+					</button>
+				</hbox>
+			</frame>
+			
+		</vbox>
+	</window>'
+
+	# replace wallpaper bit above with this, to allow only wallpapers found in the base sfs
+	#			<hbox>
+	#				<text><label>Wallpaper:</label></text>
+	#				<combobox width-request="250">
+	#				<variable>WALLPAPER</variable>
+	#				'${WALLPAPERS}'
+	#				</combobox>
+	#			</hbox>
+
+	$GTKDIALOG --program "themeChooser" --center
+	unset "themeChooser"
+
+}
+
+# select the correct icon layout in PuppyPin, called in set_puppypin_options (), only if "default" icon layout selected in get_themes()
+get_puppypin_default_layout () {
+# find default terminal
+TERMINAL=`chroot "${BASEDIR}" which urxvt`
+[ "$TERMINAL" = "" ] && TERMINAL=`chroot "${BASEDIR}" which mrxvt` #120412
+[ "$TERMINAL" = "" ] && TERMINAL=`chroot "${BASEDIR}" which rxvt`
+# for woof builds, with DISTRO_SPECS
+if [ -f "${BASEDIR}/etc/DISTRO_SPECS" ];then
+	# get distro specs info, if it exists
+	. "${BASEDIR}/etc/DISTRO_SPECS"
+	# return unique layout, depending on the puppy version
+	case "$DISTRO_FILE_PREFIX" in
+	lupu|luci) #lucid specific pinboards
+	 if [ $DISTRO_VERSION -lt 515 ];then #lucid >=515
+	 export DEFAULTPIN="  <icon x=\"96\" y=\"36\" label=\"help\">/usr/sbin/puppyhelp</icon>
+  <icon x=\"96\" y=\"320\" label=\"play\">/usr/local/bin/defaultmediaplayer</icon>
+  <icon x=\"96\" y=\"224\" label=\"email\">/usr/local/bin/defaultemail</icon>
+  <icon x=\"96\" y=\"128\" label=\"calc\">/usr/local/bin/defaultspreadsheet</icon>
+  <icon x=\"416\" y=\"32\" label=\"console\">${TERMINAL}</icon>
+  <icon x=\"352\" y=\"32\" label=\"edit\">/usr/local/bin/defaulttexteditor</icon>
+  <icon x=\"32\" y=\"416\" label=\"connect\">/usr/local/apps/Connect</icon>
+  <icon x=\"32\" y=\"320\" label=\"plan\">/usr/local/bin/defaultcalendar</icon>
+  <icon x=\"32\" y=\"32\" label=\"file\">/usr/local/bin/rox</icon>
+  <icon x=\"32\" y=\"224\" label=\"browse\">/usr/local/bin/defaultbrowser</icon>
+  <icon x=\"32\" y=\"128\" label=\"write\">/usr/local/bin/defaultwordprocessor</icon>
+  <icon x=\"32\" y=\"512\" label=\"quickpet\">/usr/sbin/quickpet</icon>
+  <icon x=\"288\" y=\"32\" label=\"setup\">/usr/sbin/wizardwizard</icon>
+  <icon x=\"224\" y=\"32\" label=\"install\">/usr/sbin/dotpup</icon>
+  <icon x=\"224\" y=\"128\" label=\"draw\">/usr/local/bin/defaultdraw</icon>
+  <icon x=\"1648\" y=\"32\" label=\"lock\">/usr/local/apps/Xlock</icon>
+  <icon x=\"1648\" y=\"224\" label=\"trash\">/usr/local/apps/Trash</icon>
+  <icon x=\"1648\" y=\"128\" label=\"zip\">/usr/local/apps/PupZip</icon>
+  <icon x=\"160\" y=\"36\" label=\"mount\">/usr/sbin/pmount</icon>
+  <icon x=\"160\" y=\"224\" label=\"chat\">/usr/local/bin/defaultchat</icon>
+  <icon x=\"160\" y=\"128\" label=\"paint\">/usr/local/bin/defaultpaint</icon>"
+	  else #lucid 500 - 511
+	 export DEFAULTPIN="  <icon x=\"160\" y=\"128\" label=\"paint\">/usr/local/bin/defaultpaint</icon>
+  <icon x=\"160\" y=\"36\" label=\"mount\">/usr/sbin/pmount</icon>
+  <icon x=\"1248\" y=\"128\" label=\"zip\">/usr/local/apps/PupZip</icon>
+  <icon x=\"1248\" y=\"224\" label=\"trash\">/usr/local/apps/Trash</icon>
+  <icon x=\"1248\" y=\"32\" label=\"lock\">/usr/local/apps/Xlock</icon>
+  <icon x=\"224\" y=\"128\" label=\"draw\">/usr/local/bin/defaultdraw</icon>
+  <icon x=\"224\" y=\"32\" label=\"install\">/usr/sbin/dotpup</icon>
+  <icon x=\"288\" y=\"32\" label=\"setup\">/usr/sbin/wizardwizard</icon>
+  <icon x=\"96\" y=\"416\" label=\"quickpet\">/usr/sbin/quickpet</icon>
+  <icon x=\"32\" y=\"128\" label=\"write\">/usr/local/bin/defaultwordprocessor</icon>
+  <icon x=\"32\" y=\"224\" label=\"browse\">/usr/local/bin/defaultbrowser</icon>
+  <icon x=\"32\" y=\"32\" label=\"file\">/usr/local/bin/rox</icon>
+  <icon x=\"32\" y=\"320\" label=\"plan\">/usr/local/bin/defaultcalendar</icon>
+  <icon x=\"32\" y=\"416\" label=\"connect\">/usr/local/apps/Connect</icon>
+  <icon x=\"352\" y=\"32\" label=\"edit\">/usr/local/bin/defaulttexteditor</icon>
+  <icon x=\"416\" y=\"32\" label=\"console\">${TERMINAL}</icon>
+  <icon x=\"96\" y=\"128\" label=\"calc\">/usr/local/bin/defaultspreadsheet</icon>
+  <icon x=\"96\" y=\"224\" label=\"email\">/usr/local/bin/defaultemail</icon>
+  <icon x=\"96\" y=\"320\" label=\"play\">/usr/local/bin/defaultmediaplayer</icon>
+  <icon x=\"96\" y=\"36\" label=\"help\">/usr/sbin/puppyhelp</icon>"
+	fi
+	 ;;
+	*) #all other puppies with DISTRO_SPECS
+	export DEFAULTPIN="  <icon x=\"96\" y=\"320\" label=\"play\">/usr/local/bin/defaultmediaplayer</icon>
+  <icon x=\"224\" y=\"32\" label=\"install\">/usr/sbin/dotpup</icon>
+  <icon x=\"96\" y=\"224\" label=\"email\">/usr/local/bin/defaultemail</icon>
+  <icon x=\"96\" y=\"128\" label=\"calc\">/usr/local/bin/defaultspreadsheet</icon>
+  <icon x=\"32\" y=\"416\" label=\"connect\">/usr/local/apps/Connect</icon>
+  <icon x=\"32\" y=\"320\" label=\"plan\">/usr/local/bin/defaultcalendar</icon>
+  <icon x=\"32\" y=\"32\" label=\"file\">/usr/local/bin/rox</icon>
+  <icon x=\"96\" y=\"36\" label=\"help\">/usr/sbin/puppyhelp</icon>
+  <icon x=\"160\" y=\"36\" label=\"mount\">/usr/sbin/pmount</icon>
+  <icon x=\"32\" y=\"224\" label=\"browse\">/usr/local/bin/defaultbrowser</icon>
+  <icon x=\"32\" y=\"128\" label=\"write\">/usr/local/bin/defaultwordprocessor</icon>
+  <icon x=\"416\" y=\"32\" label=\"console\">${TERMINAL}</icon>
+  <icon x=\"352\" y=\"32\" label=\"edit\">/usr/local/bin/defaulttexteditor</icon>
+  <icon x=\"224\" y=\"128\" label=\"draw\">/usr/local/bin/defaultdraw</icon>
+  <icon x=\"288\" y=\"32\" label=\"setup\">/usr/sbin/wizardwizard</icon>
+  <icon x=\"160\" y=\"224\" label=\"chat\">/usr/local/bin/defaultchat</icon>
+  <icon x=\"160\" y=\"128\" label=\"paint\">/usr/local/bin/defaultpaint</icon>
+  <icon x=\"1248\" y=\"32\" label=\"lock\">/usr/local/apps/Xlock</icon>
+  <icon x=\"1248\" y=\"224\" label=\"trash\">/usr/local/apps/Trash</icon>
+  <icon x=\"1248\" y=\"128\" label=\"zip\">/usr/local/apps/PupZip</icon>"
+	;;
+	esac
+else # simple fix for pre-woof puppies (no /etc/DISTRO_SPECS)
+[ "$DEFAULTPIN" = "" ] && export DEFAULTPIN="  <icon x=\"96\" y=\"320\" label=\"play\">/usr/local/bin/defaultmediaplayer</icon>
+  <icon x=\"224\" y=\"32\" label=\"install\">/usr/sbin/petget</icon>
+  <icon x=\"96\" y=\"224\" label=\"email\">/usr/local/bin/defaultemail</icon>
+  <icon x=\"96\" y=\"128\" label=\"calc\">/usr/local/bin/defaultspreadsheet</icon>
+  <icon x=\"32\" y=\"416\" label=\"connect\">/usr/local/apps/Connect</icon>
+  <icon x=\"32\" y=\"320\" label=\"plan\">/usr/local/bin/defaultcalendar</icon>
+  <icon x=\"32\" y=\"36\" label=\"file\">/usr/local/bin/rox</icon>
+  <icon x=\"96\" y=\"36\" label=\"help\">/usr/sbin/puppyhelp</icon>
+  <icon x=\"160\" y=\"36\" label=\"mount\">/usr/sbin/pmount</icon>
+  <icon x=\"32\" y=\"224\" label=\"browse\">/usr/local/bin/defaultbrowser</icon>
+  <icon x=\"32\" y=\"128\" label=\"write\">/usr/local/bin/defaultwordprocessor</icon>
+  <icon x=\"416\" y=\"32\" label=\"console\">${TERMINAL}</icon>
+  <icon x=\"352\" y=\"32\" label=\"edit\">/usr/local/bin/defaulttexteditor</icon>
+  <icon x=\"224\" y=\"128\" label=\"draw\">/usr/local/bin/defaultdraw</icon>
+  <icon x=\"288\" y=\"32\" label=\"setup\">/usr/sbin/wizardwizard</icon>
+  <icon x=\"160\" y=\"224\" label=\"chat\">/usr/local/bin/defaultchat</icon>
+  <icon x=\"160\" y=\"128\" label=\"paint\">/usr/local/bin/defaultpaint</icon>
+  <icon x=\"992\" y=\"696\" label=\"lock\">/usr/local/apps/Xlock</icon>
+  <icon x=\"916\" y=\"696\" label=\"trash\">/usr/local/apps/Trash</icon>
+  <icon x=\"224\" y=\"224\" label=\"zip\">/usr/local/apps/PupZip</icon>"
+fi
+
+}
+
+# called by set_themes, to update PuppyPin in ${BASEDIR}
+set_puppypin_options () {
+	
+	echo ""
+	if [ "$fullicons" = true ]; then
+		echo "Applying full desktop icon layout"
+		# get the default PuppyPin layout for the chosen ISO
+		get_puppypin_default_layout
+		# create new PuppyPin in /tmp
+		touch -f /tmp/woofyPuppyPin
+		cat > /tmp/woofyPuppyPin <<EOF
+<?xml version="1.0"?>
+<pinboard>
+<backdrop style="Stretched">/usr/share/backgrounds/default.jpg</backdrop>
+${DEFAULTPIN}
+</pinboard>
+EOF
+	elif [ "$minimalicons" = true ]; then
+		echo "Applying minimal desktop icon layout"
+		# create new PuppyPin in /tmp
+		touch -f /tmp/woofyPuppyPin
+		cat > /tmp/woofyPuppyPin <<EOF
+<?xml version="1.0"?>
+<pinboard>
+  <backdrop style="Stretched">/usr/share/backgrounds/default.jpg</backdrop>
+  <icon x="32" y="162" label="edit">/usr/local/bin/defaulttexteditor</icon>
+  <icon x="32" y="354" label="console">/usr/bin/urxvt</icon>
+  <icon x="32" y="450" label="browse">/usr/local/bin/defaultbrowser</icon>
+  <icon x="32" y="66" label="file">/usr/local/bin/rox</icon>
+  <icon x="32" y="258" label="play">/usr/local/bin/defaultmediaplayer</icon>
+</pinboard> 
+EOF
+	elif [ "$noicons" = true ]; then
+		echo "Applying bare desktop icon layout (no program icons)"
+		# create new PuppyPin in /tmp
+		touch -f /tmp/woofyPuppyPin
+		cat > /tmp/woofyPuppyPin <<EOF
+<?xml version="1.0"?>
+<pinboard>
+  <backdrop style="Stretched">/usr/share/backgrounds/default.jpg</backdrop>
+</pinboard>
+EOF
+	fi
+	# if new PuppyPin was chosen, copy to ${BASEDIR}
+	if [ "$sameicons" != true ];then #120412 small type fix
+		# copy the new PuppyPin to ${BASEDIR}
+		cp --remove-destination -f -a -v /tmp/woofyPuppyPin "${BASEDIR}/root/Choices/ROX-Filer/PuppyPin"
+		echo "PuppPin updated..."
+	fi
+}
+
+# usage: set_themes "${iconTheme}" "$jwmTheme" "$WALLPAPER" "$gtkTheme" "${BASEDIR}"
+set_themes () {
+
+	echo "Setting themes..."
+
+	if [ "${iconTheme}" != "" ];then
+
+		echo " Creating and copying this icon theme:${iconTheme}..."
+		# icons - remove the default icons from the ${BASEDIR}
+		rm -r "${BASEDIR}/usr/local/lib/X11/pixmaps/"* # keep the * at the end of /pixmaps/ folder gets removed!
+
+		# for each SVG file in ${iconTheme} folder, remove its png from pixmaps dir, convert, scale, add to pixmaps dir
+		for ONESVG in `find ${BASEDIR}/usr/local/lib/X11/themes/${iconTheme}/ -maxdepth 1 -type f -name \*.svg | tr '\n' ' '`
+		do
+			ONEBASENAME="`basename ${ONESVG} .svg`"
+			rm -f "${BASEDIR}/usr/local/lib/X11/pixmaps/${ONEBASENAME}48.png"
+			rsvg-convert -w 48 -h 48 -o "${BASEDIR}/usr/local/lib/X11/pixmaps/${ONEBASENAME}48.png" "${ONESVG}"
+			rm -f "${BASEDIR}/usr/local/lib/X11/pixmaps/${ONEBASENAME}24.png"
+			rsvg-convert -w 24 -h 24 -o "${BASEDIR}/usr/local/lib/X11/pixmaps/${ONEBASENAME}24.png" "${ONESVG}"
+			echo "${BASEDIR}/usr/local/lib/X11/pixmaps/${ONEBASENAME}24.png created"
+		done
+		# for each png in ${iconTheme} dir, copy to pixmaps dir, update file times, create 24x24 version if needed
+		for ONEPNG in `find ${BASEDIR}/usr/local/lib/X11/themes/${iconTheme}/ -maxdepth 1 -name \*.png | tr '\n' ' '`
+		do
+			ONEBASENAME="`basename ${ONEPNG} .png`"
+			cp --remove-destination -f "${ONEPNG}" "${BASEDIR}/usr/local/lib/X11/pixmaps/"
+			touch -m "${BASEDIR}/usr/local/lib/X11/pixmaps/${ONEBASENAME}.png" #v3.98
+			xONEBASENAME="`basename $ONEBASENAME 48`"
+			if [ "$xONEBASENAME" != "$ONEBASENAME" ] && [ ! -f "${BASEDIR}/usr/local/lib/X11/themes/${iconTheme}/${ONEPNG}" ];then #scale to 24 pixels...
+			pngtopnm -alpha "${ONEPNG}" > "/tmp/temp.pbm" #separate transparency channel.
+			pnmscale -reduce 2 "/tmp/temp.pbm" > "/tmp/temp2.pbm"
+			pngtopnm "${ONEPNG}" | pnmscale -reduce 2 | pnmtopng -alpha=/tmp/temp2.pbm > "${BASEDIR}/usr/local/lib/X11/pixmaps/${xONEBASENAME}24.png"
+			touch -m "${BASEDIR}/usr/local/lib/X11/pixmaps/${xONEBASENAME}24.png" #v3.98
+			echo "${BASEDIR}/usr/local/lib/X11/pixmaps/${xONEBASENAME}24.png created"
+			fi
+		done
+		echo "Icon theme created..."
+	fi
+
+	# replace icon theme in the settings file, if it exists
+	[ -f "${BASEDIR}/etc/desktop_icon_theme" ] && echo "${iconTheme}" > "${BASEDIR}/etc/desktop_icon_theme"
+
+	# jwm - replace jwm defaults with the chosen jwm themes
+	[ "$jwmTheme" != "" ] && cp --remove-destination -f -v "${BASEDIR}/root/.jwm/themes/$jwmTheme-colors" "${BASEDIR}/root/.jwm/jwm_colors"
+	[ "$jwmTheme" != "" ] && cp --remove-destination -f -v "${BASEDIR}/root/.jwm/themes/$jwmTheme-jwmrc" "${BASEDIR}/root/.jwm/jwmrc-theme"
+
+	# wallpaper - replace default wallpaper image, with chosen wallpaper image, if exists
+	if [ "${WALLPAPER}" != "" ] && [ -f "${WALLPAPER}" ];then
+		export WALLPAPERNAME=`basename "${WALLPAPER}"`
+		cp --remove-destination -f -v "$WALLPAPER" "${BASEDIR}/usr/share/backgrounds/${WALLPAPERNAME}"
+		rm -f -v "${BASEDIR}/usr/share/backgrounds/default.jpg"
+		# then symlink to the new one, better this way - does not rename jpgs to png (may break the image)
+		chroot "${BASEDIR}" ln -s -f "/usr/share/backgrounds/${WALLPAPERNAME}" "/usr/share/backgrounds/default.jpg"
+		echo "Wallpaper updated..."
+	fi
+
+    ### set openbox theme ### 25/5/11
+   if [ "${obTheme}" != "" ];then
+		obt=`awk 'BEGIN{ RS="</name>"}{gsub(/.*<name>/,"");print;exit}' ${BASEDIR}/root/.config/openbox/rc.xml`
+		if [ -f "${BASEDIR}/root/.config/openbox/rc.xml" ];then #20100406
+			obPATTERN="s%$obt%${obTheme}%"
+			sed -i -e "$obPATTERN" "${BASEDIR}/root/.config/openbox/rc.xml"
+		fi
+	fi
+
+	# gtk theme - replace contents of "${BASEDIR}/root/.gtkrc-2.0" with chosen theme
+	echo "# -- THEME AUTO-WRITTEN DO NOT EDIT\n
+	include \"/usr/share/themes/${gtkTheme}/gtk-2.0/gtkrc\"
+
+	include \"/root/.gtkrc.mine\"
+
+	# -- THEME AUTO-WRITTEN DO NOT EDIT" > "${BASEDIR}/root/.gtkrc-2.0"
+	
+	# set icon layout, only if ROX exists
+	[ -x "${BASEDIR}/usr/local/apps/ROX-Filer/AppRun" ] && set_puppypin_options #120412
+
+	echo -e "\nAll themes updated...\n"
+
+}
+
+get_zdrv_name () {
+	# create zdrv name for original Woof names (puppies with full kernel versions.. fluppy, puppy431, quirky098)
+	if [ -e "${BASEDIR}/etc/DISTRO_SPECS" ];then
+		# get last 3 kernel chars, no dots, only numbers
+		export KERNEL3CHARS="`echo -n "$KERNELVER" | tr -d '.' | tr -d '\-' | tr -d '[a-z]' | rev | cut -c 1,2,3 | rev`"
+		if [ ! "$KERNEL3CHARS" ] || [ "$KERNEL3CHARS" = "" ];then # KERNELVER will be empty if ISO already has zdrv
+			# guess the zdrv path and then name... should work fine
+			ZDRVSFSPATH=`find /mnt/oldiso/ -name z${SFSPREFIX1CHAR}${SFSVER}\*.sfs`
+			export ZDRVSFS="`basename ${ZDRVSFSPATH}`" #eg zp431305.sfs
+		else
+			# rename zdrv for original Woof conventions (puppy431, quirky098, pupeee, etc)
+			ZDRVSFS="z${SFSPREFIX1CHAR}${SFSVER}${KERNEL3CHARS}.sfs" #eg zp431305.sfs
+		fi
+		# fix for unleashed puplets with DISTRO_SPECS: $SFSVER will be number, no dots, less than 430 (akita, puppy arcade, 2.14X) 
+		[ $SFSVER -lt 430 > /dev/null 2>&1 ] && export ZDRVSFS="zdrv_${SFSVER}.sfs" #eg zdrv_420.sfs
+		# rename zdrv again, for newer woof builds using short kernel versions 
+		if [ `echo "$SFSPREFIX" | tr "\-" "_" | grep "puppy_*_"` ];then # such as   puppy_wary_   puppy_spup_   puppy_sqzd_
+			export ZDRVSFS="${SFSPREFIX/puppy/zdrv}${SFSVER}.sfs" #eg zdrv_spup_1.21.02.sfs
+		fi
+	fi
+}
+
+# clean all stuff created by woofy
+cleanup_files () {
+	# unmount everything (just in case)
+	unmount_iso
+	unmount_sfs
+	# ask to remove all other stuff
+	REPLY=""
+	Xdialog --title "Woofy $VERSION" --yesno "Remove all files created by Woofy during the remaster process (recommended)?${LASTMSG}\n" 0 0
+	REPLY=$?
+	if [ "$REPLY" = 0 ];then
+		# remove all files created, except base dir (if fails to build iso) and final iso (if success)
+		rm -r "/mnt/oldiso/" 2>/dev/null
+		rm -r "${WORKDIR}/oldsfs/" 2>/dev/null
+		rm -r "${WORKDIR}/sfspkg/" 2>/dev/null
+		rm -r "${WORKDIR}/${NAME}/" 2>/dev/null
+		rm -r "${WORKDIR}/zdrv/" 2>/dev/null
+		rm -v "${WORKDIR}/old.iso" 2>/dev/null
+		rm -v "${WORKDIR}/zdrv.sfs" 2>/dev/null
+		rm -v "/tmp/woofyPuppyPin" 2>/dev/null
+		#200712
+		[ -f "/tmp/${SEARCH_RESULTS_TXT}" ] && mv "/tmp/${SEARCH_RESULTS_TXT}" "${WORKDIR}/${SEARCH_RESULTS_TXT}"
+		[ -f "${HOME}/${MISSING_LIBS_TXT}" ] && mv "${HOME}/${MISSING_LIBS_TXT}" "${WORKDIR}/${MISSING_LIBS_TXT}"
+		# ask to remove BASEDIR, if still exists
+		REPLY=""
+		[ -d "${BASEDIR}" ] && Xdialog --title "Woofy $VERSION"  --default-no --yesno "Delete all files in '${BASEDIR##*/}'?\n\n(These files make the actual filesystem in the sfs file added to your ISO)" 0 0
+		REPLY=$?
+		[ "$REPLY" = 0 ] && rm -f -r "${BASEDIR}/" 2>/dev/null
+		# ask to remove PKGDIR, if still exists
+		REPLY=""
+		[ -d "${PKGDIR}" ] &&  Xdialog --title "Woofy $VERSION"  --default-no --yesno "Delete all packages in your '${PKGDIR##*/}' folder?\n\nThese files are the packages added to your ISO, you probably want to keep them...\n" 0 0
+		REPLY=$?
+		[ "$REPLY" = 0 ] && rm -r "${PKGDIR}/" 2>/dev/null
+	fi
+	# tell user what is left over
+	LEFTOVERS=""
+	[ -d "${BASEDIR}" ] && LEFTOVERS="${BASEDIR}\n"
+	[ "$LEFTOVERS" ] && DELIM="\n" || DELIM=''
+	#200712
+	[ -f "${WORKDIR}/${MISSING_LIBS_TXT}" ] && LEFTOVERS="${LEFTOVERS}${DELIM}${WORKDIR}/${MISSING_LIBS_TXT}"
+	[ "$LEFTOVERS" ] && DELIM="\n" || DELIM=''
+	[ -f "${WORKDIR}/${SEARCH_RESULTS_TXT}" ] && LEFTOVERS="${LEFTOVERS}${DELIM}${WORKDIR}/${SEARCH_RESULTS_TXT}"
+	[ "$LEFTOVERS" != "" ] && LEFTOVERS="\n\nFiles remaining:\n${LEFTOVERS}\n"
+	Xdialog --title "Woofy $VERSION" --msgbox "Woofy has finished and will now exit.$LEFTOVERS" 0 0
+	unset LEFTOVERS
+	# close window
+	#rox -D "${WORKDIR}/${NAME}-iso" 2>/dev/null
+	exit 0
+}
+
+# run the remaster process
+# usage: remaster_puppy "$ISOFILE" "${NAME}" "${DELETE_LIST}" "${PKGDIR}" "${WORKDIR}" "$SUFFIX"
+remaster_puppy () {
+	# check settings first
+	check_settings
+	# settings are fine, ask to start remastering
+	Xdialog --title "Woofy $VERSION" --msgbox "Woofy will now start rebuilding your new ISO...\n\nClick OK and please wait...\n" 0 0
+
+	# clean up before start
+	unmount_sfs 2>/dev/null
+	unmount_iso 2>/dev/null
+
+	clear
+	# create the working dir
+	[ ! -d "${WORKDIR}" ] && mkdir -p "${WORKDIR}"
+	# set the base dir, using latest ${WORKDIR} value
+	BASEDIR="${WORKDIR}/sfs-base"
+
+	# mount the $ISOFILE iso, will exit and cleanup if error
+	mount_iso
+
+	# go into ${WORKDIR}
+	cd "${WORKDIR}"
+
+	# get the name of the MAIN sfs file in iso (check for pup_*.sfs first)
+	OLDSFSPATH=`find /mnt/oldiso/ -name pup-\*.sfs -o -name pup_\*.sfs`
+	# if no sfs found, check again, for different names
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name dpup-\*.sfs -o -name dpup_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name eee-\*.sfs -o -name eee_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name fluppy-\*.sfs -o -name fluppy_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name lupu-\*.sfs -o -name lupu_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name luci-\*.sfs -o -name luci_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name lupq-\*.sfs -o -name lupq_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name pupeee-\*.sfs -o -name puppeee_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name pupeee-\*-\*.sfs -o -name puppeee_\*_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name puppy-\*-\*.sfs -o -name puppy_\*_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name puppy-\*.sfs -o -name puppy_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name quirky-\*.sfs -o -name quirky_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name spup-\*.sfs -o -name spup_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name tpup-\*.sfs -o -name tpup_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name upup-\*.sfs -o -name upup_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name wary-\*.sfs -o -name wary_\*.sfs`
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=`find /mnt/oldiso/ -name wary-\*-\*.sfs -o -name wary_\*_\*.sfs`
+	
+	# if Woofy cannot find the MAIN sfs file, user must enter the name manually
+	[ ! "${OLDSFSPATH}" ] && OLDSFSPATH=$(Xdialog --title "Woofy $VERSION" --stdout --inputbox "IMPORTANT:\n\nWoofy cannot find the main sfs file in '$ISOFILE'.\n\nType the full path to the sfs file in '$ISOFILE' and click OK.\n\n(Look in '/mnt/oldiso' to see all the files in '$ISOFILE')\n" 0 0 "/mnt/oldiso/xxxxxxx.sfs")
+	
+	# if user didn't give the name of a real sfs, exit and cleanup
+	[ ! -f "${OLDSFSPATH}" ] && error_msg "No sfs file could be found in '$ISOFILE', cannot continue."
+
+	## get & create SFS filename 
+	OLDSFSNAME=`basename "${OLDSFSPATH}"`
+	echo "The sfs to edit: ${OLDSFSNAME}"
+
+	# get version, works for puppy_sqzd_4.99.2.sfs, puppy_spup_1.21.02.sfs, etc
+	export SFSVER=$(echo "${OLDSFSNAME%%.sfs}" | tr '_' '-' | cut -d '-' -f3)
+	# if $SFSVER still empty, use old style SFS file names.. pup_420.sfs, pup_431.sfs, etc
+	[ "$SFSVER" = "" ] && export SFSVER=$(echo "${OLDSFSNAME%%.sfs}" | tr '_' '-' | cut -d '-' -f2)
+	# get the prefix (all characters before the numbers.. example, 'pup_', 'eee-', or 'puppy_spup_')
+	export SFSPREFIX=${OLDSFSNAME%%[0-9]*}
+	# get first character of $SFSPREFIX
+	export SFSPREFIX1CHAR="`echo -n "$SFSPREFIX" | cut -c 1`"
+	## create the new sfs name, which will be "$SFSPREFIX$SFSVER$SUFFIX.sfs"
+	export SFSNAME="$SFSPREFIX$SFSVER$SUFFIX.sfs"
+	echo "The main sfs name will be: $SFSNAME"
+
+	# create the base - unsquash/mount the sfs, copy its contents to ${BASEDIR}, unmount it
+	# mount the original sfs, exit and cleanup if fail
+	mount_sfs # copies contents of SFS to BASEDIR
+	unmount_sfs # unmount the $OLDSFS file
+
+	# check ${BASEDIR} is not empty, exit if empty
+	[ ! "$(ls -A ${BASEDIR})" ] && error_msg "The contents of ${OLDSFSNAME} not extracted to ${BASEDIR}, cannot continue"
+	
+	# make sfs files v3 or v4, depending on what is default in the mounted iso
+	MKSFS=mksquashfs
+	# use 'mksquashfs' if specific version not found
+	if [ -e "${BASEDIR}/usr/sbin/mksquashfs" ];then
+		[ "`${BASEDIR}/usr/sbin/mksquashfs -version | head -1 | grep "4\."`" != "" ] && MKSFS=mksquashfs4 || MKSFS=mksquashfs3
+	fi
+	echo -e "\nUsing '/usr/sbin/${MKSFS}' to build SFS file\n"
+
+	# prepare dir for new iso, will contain vmlinuz, initrd.gz, pup.sfs, zdrv*.sfs, etc
+	# make a new dir for the new iso, using ${NAME}
+	[ ! -d "${WORKDIR}/${NAME}" ] && mkdir -p "${WORKDIR}/${NAME}"
+
+	# copy all files from the old iso, to the new tmp iso dir
+	cp --remove-destination --preserve=all -f -r "/mnt/oldiso/"* "${WORKDIR}/${NAME}" && echo "Files from $(basename $ISOFILE) copied to ${NAME}"
+
+	# check files were copied from iso, exit if empty
+	[ ! "$(ls -A ${WORKDIR}/${NAME})" ] && error_msg "The contents of $ISOFILE not extracted to ${WORKDIR}/${NAME}, cannot continue"
+
+	# remove the old sfs from the new iso dir
+	rm -f -v "${WORKDIR}/${NAME}/${OLDSFSNAME}"
+
+	 #180712 allow user to remove files from the new ISO
+	 if [ "$DELETEAPPS" = true ];then
+	 	make_file_list # make list of files
+	 	if [ "$FILE_LIST" != "" ];then
+			# show GUI with checkbox list of all files returned by make_file_list
+			PROGS_TO_DELETE=$(Xdialog --stdout --no-tags --title "Woofy $VERSION" --checklist "Choose the programs that you want to delete.\nBE VERY CAREFUL!" 25 50 0 $FILE_LIST)
+			if [ $? -eq 0 ];then
+				SEARCH_QUERY="${PROGS_TO_DELETE//\// }" # create a search from the Xdialog output
+				search_files "$SEARCH_QUERY" # perform the search
+				# show the list of files created by search_files, let user edit the list before doing anything else
+				[ -s "/tmp/$SEARCH_RESULTS_TXT" ] && EDITED_LIST=$(Xdialog --stdout --backtitle "Edit this list as required and click 'Delete files'.\nBE VERY CAREFUL!" --title "Files to delete from ISO" --ok-label "Delete files" --editbox "/tmp/$SEARCH_RESULTS_TXT" 30 75)
+				if [ $? -eq 0 ];then
+					echo "$EDITED_LIST" > "/tmp/${SEARCH_RESULTS_TXT}" # put the final, edited list in the file /tmp/${SEARCH_RESULTS_TXT}
+					# delete the files in the list from the new SFS filesystem
+					echo "Woofy will now delete all the files listed in /tmp/${SEARCH_RESULTS_TXT}...." 
+					delete_files "/tmp/${SEARCH_RESULTS_TXT}" "${BASEDIR}" || echo -e "\nNo files deleted from ${BASEDIR}\n"
+				fi
+			fi
+		fi
+	fi
+	
+	# delete all files, in ${BASEDIR}, from the list ${delete}
+	#[ -f "${DELETE_LIST}" ] && delete_files "${DELETE_LIST}" "${BASEDIR}" || echo -e "\nNo files deleted from ${BASEDIR}\n"
+
+	# add packages to ${BASEDIR}
+	[ -d "${PKGDIR}" ] && add_pkg "${PKGDIR}" "${WORKDIR}" "${BASEDIR}" || echo -e "\nNo packages to add\n"
+
+	#120412, all pkgs added, check for deps in ${BASEDIR}.. thx to jemimah	REPLY=''
+	LDD_CHECK="$(chroot ${BASEDIR} ldd `which sh` 2>/dev/null )" #120413 added check for ldd, as in some rare cases (pupngo) it's not there
+	if [ "$LDD_CHECK" != "" ];then
+		REPLY=''
+		Xdialog --title "Woofy $VERSION" --yesno "Check for missing dependencies? (It could be very slow...)" 0 0
+		REPLY=$?
+		[ "$REPLY" = 0 ] && check_deps 
+	fi
+	# get kernel version of the puppy being remastered - used to make name for older Woof built zdrvs, and to locate modules dir later 
+	# its ok that sometimes nothing is return in KERNELVER, as it shows us a zdrv is already in use
+	KERNELVERSHORT=`ls "${BASEDIR}/lib/modules" | grep -m1 ^2.6` 
+	[ "$KERNELVERSHORT" = "" ] && KERNELVERSHORT=`ls "${BASEDIR}/lib/modules" | grep -m1 ^3.` #111229, kernels 3.x
+	# get the longer version number, should return blank if the above is already the full kernel version
+	KERNELVERLONG=`ls "${BASEDIR}/lib/modules" | grep -m1 ${KERNELVERSHORT}.`
+	# if $KERNELVERLONG is blank, KERNELVERSHORT already holds the full version number
+	[ "${KERNELVERLONG}" = "" ] && KERNELVER="${KERNELVERSHORT}" || KERNELVER="${KERNELVERLONG}"
+
+	## first, set zdrv name, based on oldest naming conventions (anything before puppy 430)
+	ZDRVSFS="zdrv_${SFSVER}.sfs"
+	# get zdrv name, use a function 'cause we call it again later, if we need to
+	get_zdrv_name
+	
+	#120412 only re-check if zdrv still not found 
+	HASZDRV="no"
+	# check for zdrv now, we might already have its name...
+	[ "${ZDRVSFS}" != "" ] && [ -f "/mnt/oldiso/${ZDRVSFS}" ] && HASZDRV="yes"
+	# double check, maybe $KERNELVER not right yet, but this should work
+	[ "${HADZDRV}" = "no" ] && [ "`ls /mnt/oldiso/ | grep z${SFSPREFIX1CHAR}${SFSVER}`" != "" ] && HASZDRV="yes"
+	# to be safe, double check for older ones
+	[ "${HADZDRV}" = "no" ] && [ "`ls /mnt/oldiso/ | grep zdrv_`" ] && HASZDRV="yes"
+
+	# build ZDRV
+	if [ "$HASZDRV" = "no" ];then
+		REPLY=""
+		SFSEXCLUDE=""
+		# ask to build a zdrive sfs file, if none found in mounted iso
+		if [ -d "${BASEDIR}/lib/modules" ];then #120412: check if can build one first!
+		  Xdialog --title "Woofy $VERSION" --yesno "Create a separate SFS file called a 'zdrive', containing the kernel drivers?" 0 0
+		  REPLY=$?
+		else
+		  REPLY=1
+		fi
+		if [ "$REPLY" = 0 ];then # build zdrv, remove modules from main SFS
+			# manually get the kernel version if stil not found - we really need it now, to find kernel modules & name the zdrv
+			if [ "${KERNELVER}" = "" ];then
+				KERNELVER=$(Xdialog --title "Woofy $VERSION" --stdout --inputbox "IMPORTANT: Woofy cannot find the kernel version used in $ISOFILE! \n\nTo find the kernel version:\n\nLook in /lib/modules, in the zdrv sfs file found at /mnt/oldiso.\n(Simply click on the zdrv file to see inside it)\n\nThe zdrv may be named something like zp431516.sfs or zdrv_*.sfs.\n\nAlternatively, if you see no zdrv file, look inside ${BASEDIR}/lib/modules\n\nTYPE THE KERNEL VERSION USED IN ${ISOFILE}THEN CLICK OK.\n" 0 0 "Enter ONLY the kernel version here, example: 2.6.25.16")
+				get_zdrv_name # update zdrv name with new kernel version information
+			fi
+			# tell the zdrv file name
+			echo -e "\nThe kernel version will be: ${KERNELVER}"
+			echo "The zdrv name will be: ${ZDRVSFS}\n"
+			# remove old zdrv if found 
+			[ -f "${WORKDIR}/${NAME}/${ZDRVSFS}" ] && rm -f -v "${WORKDIR}/${NAME}/${ZDRVSFS}"
+			# exclude stuff copied from initrd
+			ZDRVEXCLUDE=${BASEDIR}/lib/modules/${KERNELVER}/initrd/lib/modules/*/modules.*
+			# make the zdrv sfs file
+			echo "Excluded from zdrv: $ZDRVEXCLUDE"
+			echo "building ${ZDRVSFS}... Please wait..."
+
+			#rxvt -e $MKSFS /lib "${WORKDIR}/${NAME}/${ZDRVSFS}" -keep-as-directory -e /lib/[^m]* "${ZDRVEXCLUDE}"
+			$MKSFS ${BASEDIR}/lib "${WORKDIR}/${NAME}/${ZDRVSFS}" -keep-as-directory -e ${BASEDIR}/lib/[^m]* "${ZDRVEXCLUDE}" | while read -n 50 LINE ; do
+			echo $LINE |egrep '[0-9]\%'| cut -f1 -d% |awk '{print $NF}'|grep -v '\.' ;done | \
+			Xdialog --title "Woofy ${VERSION}" --gauge "Building '${ZDRVSFS}' zdrive file. Please wait..." 0 0  #120412
+
+			# if the zdrv sfs exists, exclude contents of zdrv from the main sfs
+			if [ -f "${WORKDIR}/${NAME}/${ZDRVSFS}" ];then
+				export SFSEXCLUDE="-e ${BASEDIR}/lib/modules"
+				# remove zdrv files from ${BASEDIR}, to be safe
+				rm -f -r "${BASEDIR}/lib/modules/"
+			fi
+		fi
+	else # HASZDRV=yes
+		REPLY=""
+		SFSEXCLUDE=""
+		# ask to build a zdrive sfs file, if none found in mounted iso
+		Xdialog --title "Woofy $VERSION" --yesno "Move the kernel drivers into the main SFS (no zdrv)?" 0 0
+		REPLY=$?
+		if [ "$REPLY" = 0 ];then
+			# get work dir ready for unsquashing zdrv
+			[ -d "${WORKDIR}/zdrv" ] && rmdir -f "${WORKDIR}/zdrv"
+			# copy the zdrv file to ${WORKDIR} as 'zdrv.sfs'
+			cp --remove-destination -v "/mnt/oldiso/${ZDRVSFS}" "${WORKDIR}/zdrv.sfs"
+			# unpack the sfs file, using the default squashfs of host
+			unsquashfs -f -d "${BASEDIR}" "${WORKDIR}/zdrv.sfs" 2>/dev/null
+			# try again if it failed, with sfs4
+			[ $? -eq 1 ] && unsquashfs4 -f -d "${BASEDIR}" "${WORKDIR}/zdrv.sfs" 2>/dev/null
+			# try again if it failed, with sfs3
+			[ $? -eq 1 ] && unsquashfs3 -f -d "${BASEDIR}" "${WORKDIR}/zdrv.sfs" 2>/dev/null
+			# if totally failed to unsquash, try to mount it instead
+			if [ $? -eq 1 ];then
+				[ ! -d "${WORKDIR}/zdrv" ] && mkdir "${WORKDIR}/zdrv"
+				echo -e "\nUnsquash failed, mounting /mnt/oldiso/${ZDRVSFS} into ${WORKDIR}/zdrv... Please wait..\n"
+				mount -t squashfs -o loop,ro  "/mnt/oldiso/${ZDRVSFS}" "${WORKDIR}/zdrv"
+				[ $? -eq 1 ] && echo -e "\n${ZDRVSFS} mounted into ${WORKDIR}/zdrv/\n" || echo -e "\n${ZDRVSFS} could not be mounted into ${WORKDIR}/zdrv/\n"
+				cp --remove-destination --preserve=all -f -r "${WORKDIR}/zdrv/"* "${BASEDIR}" #keep * to copy zdrv/ contents only
+				umount "${WORKDIR}/zdrv"
+				rmdir -v "${WORKDIR}/zdrv"
+			fi
+			[ -d "${BASEDIR}/lib/modules/${KERNELVER}" ] && echo -e "\nZdrv unsquashed into ${BASEDIR}\n"
+			# delete zdrv from iso file contents
+			rm -f -v "${WORKDIR}/${NAME}/${ZDRVSFS}"
+			# remove the zdrv copy
+			rm -f -v "${WORKDIR}/zdrv.sfs"
+			echo ""
+		fi
+	fi	
+
+	# unmount the old iso and delete its mount point
+	unmount_iso
+
+	# update woofy, defaults-chooser and initrd-editor if already installed in the iso #120412 only update woofy folder and woofy itself
+    if [ -f "${BASEDIR}/usr/bin/woofy" ];then
+		echo -e "\nUpdating woofy in the new sfs...\n"
+		cp --remove-destination -f -pa /usr/bin/woofy "${BASEDIR}/usr/bin"
+	    [ -d "${BASEDIR}/usr/local/woofy" ] && cp --remove-destination -f -r -pa /usr/local/woofy/ "${BASEDIR}/usr/local/woofy/" #120412
+	fi
+#120412 disabled the auto update of this scripts, see above
+#    if [ -f "${BASEDIR}/usr/bin/defaults-chooser" ];then
+#		echo "Updating defaults-chooser in the new sfs..."
+#		cp --remove-destination -f -pa /usr/bin/defaults-chooser "${BASEDIR}/usr/bin"
+#	fi
+#    if [ -f "${BASEDIR}/usr/bin/initrd-editor.sh" ];then
+#		echo "Updating initrd-editor.sh in the new sfs..."
+#		cp --remove-destination -f -pa /usr/local/woofy/initrd-editor.sh "${BASEDIR}/usr/bin"
+#	fi
+
+	# update themes and defaults apps
+	if [  "$setdefs" = true ];then
+		#120412, use a chroot to set default WM in ${BASEDIR}
+		#120413 check for "${BASEDIR}/etc/windowmanager"
+		[ -f "${BASEDIR}/etc/windowmanager" ] && /usr/local/woofy/wmswitcher "${BASEDIR}"
+		# ask user to edit themes (gtk, icon, wallaper and jwm)
+		THEMEREPLY=""
+		Xdialog --title "Woofy $VERSION" --yesno "Edit the default GTK, JWM, Openbox and icon themes?" 0 0
+		# get the answer
+		THEMEREPLY="$?"
+		# if reply was yes
+		if [ "$THEMEREPLY" = 0 ];then
+			# run the theme chooser dialog, in get_themes function (which runs set_themes(), to set the chosen options)
+			get_themes
+			echo -e "\nDefault themes updated..."
+			#Xdialog --title "Woofy $VERSION" --msgbox "Default themes updated. Click OK to continue." 0 0
+		else
+			echo "Default themes not updated..."
+		fi
+		# ask user set the preferred defaults apps, before building sfs
+		DEFSREPLY=""
+			Xdialog --title "Woofy $VERSION" --yesno "Choose your preferred default applications?" 0 0
+			DEFSREPLY="$?"
+			# if reply was yes, chroot and run defaults-chooser
+			if [ "$DEFSREPLY" = 0 ];then
+				/usr/local/woofy/defaults-chooser "${BASEDIR}" #120412, defaults-chooser will chroot into ${BASEDIR}/usr/local/bin
+				echo "Default apps updated"
+			else
+				echo "Default apps not updated"
+			fi
+	fi
+	
+	# manual edit ${BASEDIR}, allow user to edit the sfs contents before creating the sfs file itself
+	if [  "$EDITSFS" = true ];then
+		SFSREPLY=""
+		Xdialog --title "Woofy $VERSION" --yesno "Edit the main filesystem contents, before it is created?" 0 0
+		# get the answer
+		SFSREPLY="$?"
+		# if reply was yes, open rox
+		if [ "$SFSREPLY" = 0 ];then
+			rox -d "${BASEDIR}" 2>/dev/null
+			sleep 1
+			Xdialog --title "Woofy $VERSION" --msgbox "Click OK when finished editing your files." 0 0
+			rox -D "${BASEDIR}" 2>/dev/null
+		fi
+	fi
+
+	# update menus
+	# run fixmenus on the sfs filesystem, to update its menus
+	chroot "${BASEDIR}" /usr/sbin/fixmenus 2>/dev/null
+
+	# build main sfs - BASEDIR is now ready, make an sfs from its contents
+	# build the new sfs, exclude /lib/modules, if zdrv was created earlier
+	echo -e "\nBuilding ${WORKDIR}/$SFSNAME, please wait..."
+
+	rxvt -e $MKSFS "${BASEDIR}" "${WORKDIR}/$SFSNAME" $SFSEXCLUDE || error_msg "${WORKDIR}/$SFSNAME could not be created."
+	#$MKSFS "${BASEDIR}" "${WORKDIR}/$SFSNAME" $SFSEXCLUDE | while read -n 50 LINE ; do
+	#echo $LINE |egrep '[0-9]\%'| cut -f1 -d% |awk '{print $NF}'|grep -v '\.' ;done | \
+	#Xdialog --title "Woofy ${VERSION}" --gauge "Building ${SFSNAME}.. Please wait..." 0 0
+
+	sync
+	[ -e "${WORKDIR}/${SFSNAME}" ] && echo "New sfs created: ${WORKDIR}/$SFSNAME" || error_msg "${WORKDIR}/${SFSNAME} could not be created."
+
+	# new sfs complete, ask to remove BASEDIR and its contents
+	REPLY=""
+	Xdialog --title "Woofy $VERSION" --yesno "You can now delete the files in '${BASEDIR##*/}'.\nThis is only required now if you have very limited free space.\n\nDelete '${BASEDIR##*/}' and its contents?\n" 0 0
+	REPLY=$?
+	if [ "$REPLY" = 0 ];then
+		rm -r -f "${BASEDIR}/"
+	fi
+	
+	# move and rename new sfs to new iso dir
+	mv -v "${WORKDIR}/$SFSNAME" "${WORKDIR}/${NAME}/$SFSNAME"
+	[ ! -f "${WORKDIR}/${NAME}/$SFSNAME" ] && error_msg "$SFSNAME not copied to iso directory, cannot continue"
+
+	# get boot method that will be used in the iso
+	BOOTMETHOD=""
+	BOOTPARAM=""
+	[ -f "${WORKDIR}/${NAME}/grldr" ] && BOOTMETHOD='menu.lst' && BOOTPARAM="-b grldr" && rm -f "${WORKDIR}/${NAME}/boot.catalog"
+	[ -f "${WORKDIR}/${NAME}/isolinux.cfg" ] && BOOTMETHOD='isolinux.cfg' && BOOTPARAM="-b isolinux.bin -c boot.cat"
+
+	# edit boot options
+	if [ "$BOOTPARAMS" = true ];then
+		# ask to edit initrd.gz
+		INITRDREPLY=""
+		Xdialog --title "Woofy $VERSION" --yesno "Edit the initrd.gz file? It contains the 'init' script, used to boot ${NAME}." 0 0
+		INITRDREPLY="$?"
+		if [  "$INITRDREPLY" = 0 ];then
+			# edit initrd.gz and replace old one
+			/usr/local/woofy/initrd-editor.sh "${WORKDIR}/${NAME}/initrd.gz" "${WORKDIR}/${NAME}/"
+			# go back into work dir
+			cd "${WORKDIR}"
+		fi
+		# ask to edit isolinux or grub boot options
+		if [ "$BOOTMETHOD" ];then
+			BOOTREPLY=""
+			Xdialog --title "Woofy $VERSION" --yesno "Edit the boot options of the new ISO?" 0 0
+			BOOTREPLY="$?"
+			if [  "$BOOTREPLY" = 0 ];then
+				defaulttexteditor "${WORKDIR}/${NAME}/$BOOTMETHOD" &
+				sleep 1
+				XPID=''
+				$GTKDIALOG --program "BOOTGUI" &
+				XPID=$!
+				# pause before building iso
+				sleep 1
+				Xdialog --title "Woofy $VERSION - Boot Help" --msgbox "You should now see the file ${BOOTMETHOD} in a text editor.\nYou can edit it contents to change boot options.\n\nUse the 'Boot Options' dialog to help you.\n\nWhen you are finished, save your changes, close the \n text editor and then click the OK button.\n\nWoofy will then build your new '${NAME}.iso' file" 0 0
+				kill $XPID
+			fi
+		fi
+	fi
+
+	 ## ready to create iso
+	echo -e "\nReady to create iso file"
+
+	# final warning before iso creation
+	Xdialog --title "Woofy $VERSION" --msgbox "Important! This is your last chance to edit the files in your new live CD ISO file.\n\nIf you want to edit anything in: \n\n'${WORKDIR}/${NAME}'\n\n ..then you must do it now, before you click OK.\n\nExample: add more SFS files to the live CD or edit the boot splash image.\n" 0 0
+	
+	# delete any old isos named "${NAME}.iso", that exist in ${WORKDIR}
+	rm -f -v "${WORKDIR}/${NAME}.iso"
+	
+	# make a nice volume label
+	VOL="${NAME}"
+	[ "$VOL" != "" ] && VOL="-V $(echo "$VOL"|tr ' ' '_')"
+
+	XPID=''
+	Xdialog --title "Woofy ${VERSION}" --no-buttons --infobox "Creating the ISO file, called '${NAME}.iso'... Please wait." 0 0 99999 & #120413
+	XPID=$!
+	# build the iso from the files in the ${WORKDIR}/${NAME}
+	mkisofs -J -D -R "$VOL" -o "${WORKDIR}/${NAME}.iso" $BOOTPARAM -no-emul-boot -boot-load-size 4 -boot-info-table "${WORKDIR}/${NAME}/"
+	sync
+	kill $XPID
+
+	# check iso was created
+	[ ! -f "${WORKDIR}/${NAME}.iso" ] && error_msg "The new ISO file '${NAME}.iso' was not created."
+	
+	# make a new dir for the iso
+	[ ! -d "${WORKDIR}/${NAME}-iso" ] && mkdir -p "${WORKDIR}/${NAME}-iso"
+	# move iso to its new dir
+	mv -v "${WORKDIR}/${NAME}.iso" "${WORKDIR}/${NAME}-iso/${NAME}.iso"
+	
+	## check for iso file and tell user about the results
+	if [ -f "${WORKDIR}/${NAME}-iso/${NAME}.iso" ];then
+		rox -d "${WORKDIR}/${NAME}-iso"  2>/dev/null &
+		Xdialog --title "Woofy $VERSION" --msgbox "Success! '${NAME}.iso' created.\n\nYou can now save, copy, move or burn '${NAME}.iso'.\n" 0 0
+		LASTMSG="\n\nThis doesn't include '${NAME}.iso', which can still be found in:\n\n${WORKDIR}/${NAME}-iso"
+	else
+		Xdialog --title "Woofy $VERSION" --msgbox "\"${NAME}.iso\" was not created succesfully\n\nMake sure you have enough free memory, and all the required files are in '${WORKDIR}/${NAME}'.\n" 0 0
+		LASTMSG=""
+	fi
+	# cleanup all files and dirs created by woofy
+	cleanup_files
+	exit 0
+}
+
+# boot GUI
+BOOTGUI='
+<window title="Woofy '$VERSION' - Boot Options">
+	<vbox>
+		<frame>
+			<vbox>
+				<text><label>Puppy boot options</label></text>
+			</vbox>
+		</frame>
+		<frame>
+			<vbox>
+					<edit editable="false">
+						<variable>EDITOR</variable>
+						<width>550</width><height>300</height>
+						<default>" 
+To change boot options, edit or add more options to the initrd.gz line:
+
+	Example: initrd=initrd.gz pmedia=cd pfix=ram,nox,fsck pkeys=uk
+	
+You can add the following:
+
+BOOT OPTIONS
+
+    * pfix=ram			run Puppy totally in RAM, ignores any save file(s)
+    * pfix=<n>			where <n> is the number of saved sessions to ignore for multisession-CDs
+    * pfix=fsck			run a filesystem check on bootup
+    * pfix=rdsh			exit to initial ramdisk commandline (do not pivot_root)
+    * pfix=usbcard		for booting from USB flash drive via USB 2.0 to PCMCIA adapter
+    * pfix=clean		a simulated version upgrade (for Puppy 2.13 and later)
+    * pfix=purge		an even more radical file cleanup (for Puppy 2.14 and later)
+    * pfix=#debug 		may help with debugging
+
+	To use multiple pfix options, separate them with a comma 
+	Example: pfix=rdsh,usbcard
+
+NO PCMCIA
+
+	* nopcmcia		use this option to disable  PCMCIA (PC card) devices during bootup
+
+KEYBOARD LAYOUT
+
+	* pkeys=us
+	* pkeys=br
+	* and so on...
+	
+Choices: be br cf de dk es fi fr gr hu it jp no pl ru se uk us
+"</default>
+					</edit>
+			</vbox>
+		</frame>
+		<frame>
+			<hbox>
+				   <button>
+					  <input file stock="gtk-cancel"></input>
+					  <label> Exit </label>
+					  <action type="exit">EXIT_NOW</action>
+				   </button>
+			</hbox>
+		</frame>
+	</vbox>
+</window>'
+
+# help gui
+HELPGUI='
+<window title="Woofy '$VERSION'" width-request="500">
+	<vbox>
+		<frame>
+			<vbox homogeneous="true">
+				<text><label>Woofy '$VERSION'</label></text>
+				<text><label>Edit and rebuild any Puppy Linux live CD.</label></text>
+			</vbox>
+		</frame>
+		<frame>
+			<vbox>
+				<edit indent="10" editable="false">
+				<width>345</width><height>300</height>
+				<default>"Woofy '$VERSION', by sc0ttman
+Thanks to Iguleder, stu90, shinobar, jemimah and others.	
+			
+About Woofy:
+
+Woofy can build customised Puppy Linux ISO files,
+which are commonly known as Puplets.
+
+Woofy is a simple remaster tool for Puppy Linux, which 
+lets you edit the contents of any bootable Puppy Linux 
+live CD and save it as a new, customised live CD.
+
+You can add packages, remove files, edit the main filesystem, 
+change themes, update default apps and more, before building 
+your new customised Puppy Linux Live CD.
+
+You can also check for missing dependencies, but this is very 
+slow, and can return harmless warnings, epsecially for packages 
+that often keep libs in non-standard locations, such as Firefox.
+
+To delete files or packages from your new Puplet ISO, you must 
+supply a list of files with full paths to the stuff to delete.
+
+For example, if you want to remove a file called /usr/bin/mc 
+from the ISO, your list must have a line containing only:
+
+/usr/bin/mc
+
+Woofy can edit ISO files which use either GRUB or ISOLINUX, 
+and will automatically open the correct boot files in a text editor.
+
+You can choose to build an Puplet that uses a zdrv file, which 
+will contain all the kernel drivers (needed for hardware support).
+
+Woofy does not make any changes to the current running system.
+
+Woofy Requirements:
+				
+- A bootable Puppy Linux live CD to edit (obviously)
+
+- A working directory:  a linux partition (ext2, ext3, etc) which is at
+least 5x larger than the chosen ISO. You should use a mounted 
+partition on a hard drive or USB when possible. To use your RAM as 
+a working directory, use a directory in your main sfs, such as /tmp.
+
+- To build a list of deletable files, mount the SFS that you want to
+remaster, and use pfind or pfilesearch to search WITHIN the SFS
+for the files that you want to delete, and save the results to a file. 
+
+WARNING:
+
+If remastering a version of Puppy which uses a different SFS
+version to your own, (example, remastering Lupu while using 
+Puppy 4.2) you should probably NOT use your RAM as a working 
+directory, unless you have at least 1GB free RAM.
+
+Woofy Limitations:
+
+Woofy cannot automatically change the Puppy version number 
+of your new iso, or update its sfs version. However, you can 
+still edit the init script (inside initrd.gz), main sfs and iso files before
+they are created, to enable the full customisation of both your new
+sfs filesystem and iso contents.
+
+Woofy cannot work out which packages contain your missing libs,
+if any were reported as missing in the check Woofy provides.
+
+Woofy cannot (yet) change kernels for you.
+
+Try to avoid using spaces in your file names and paths.
+"</default>
+				</edit>
+			</vbox>
+		</frame>
+		<frame>
+			<hbox>
+				   <button>
+					  <input file stock="gtk-quit"></input>
+					  <label>Close</label>
+					  <action type="exit">EXIT_NOW</action>
+				   </button>
+			</hbox>
+		</frame>
+	</vbox>
+</window>'
+
+# main gui #180712 added checkbox to bottom frame DELETE_APPS
+WOOFYGUI='
+<window title="Woofy '$VERSION'">
+
+	<vbox>
+		<frame>
+
+			<vbox>
+				<text><label>Woofy '$VERSION' - rebuild any Puppy ISO</label></text>
+			</vbox>
+
+		</frame>
+		<frame Base ISO>
+
+			<hbox>
+				<text><label>Choose an ISO file (required):</label></text>
+				<entry tooltip-text="Choose a bootable Puppy Linux ISO file, which you will soon remaster">
+					<default>"'$ISOFILE'"</default>
+					<variable>ISOFILE</variable>
+				</entry>
+				<button>
+					<input file icon="gtk-file"></input>
+					<action type="fileselect">ISOFILE</action>
+				</button>
+			</hbox>
+
+		</frame>
+		<frame Remastered ISO>
+
+			<hbox>
+				<text><label>ISO file name (required): </label></text>
+				<entry tooltip-text="Choose a filename for your new iso file (do not include the extension)">
+					<default>"'${NAME}'"</default>
+					<variable>NAME</variable>
+				</entry><text><label>.iso  </label></text>
+			</hbox>
+
+			<hbox>
+				<text><label>Your working directory (required):</label></text>
+				<entry accept="directory" tooltip-text="This should be on a linux partition, with around 5x more space than the ISO files requires. You can leave it as /tmp, to use your RAM. However, it is HIGHLY recommended to choose a mounted usb or hard drive where possible, such as /mnt/home.">
+					<default>"'${WORKDIR}'"</default>
+					<variable>WORKDIR</variable>
+				</entry>
+				<button>
+					<input file icon="gtk-open"></input>
+					<action type="fileselect">WORKDIR</action>
+				</button>
+			</hbox>
+
+			<hbox>
+				<text><label>Puppy SFS file suffix (optional):     </label></text>
+				<entry tooltip-text="If set, this will be appended to the .sfs filename. Example: pup_420woofy.sfs. It must be alpha-numeric, with no spaces.">
+					<default>"'$SUFFIX'"</default>
+					<variable>SUFFIX</variable>
+				</entry><text><label>.sfs  </label></text>
+			</hbox>
+
+
+
+
+
+
+			<hbox>
+				<text><label>Your packages directory (optional):</label></text>
+				<entry accept="directory" tooltip-text="This directory must contain the packages you want to add. Supported packages: pet, sfs, tar.gz, deb, rpm, txz, xz">
+					<default>"'${PKGDIR}'"</default>
+					<variable>PKGDIR</variable>
+				</entry>
+				<button>
+					<input file icon="gtk-open"></input>
+					<action type="fileselect">PKGDIR</action>
+				</button>
+			</hbox>
+
+			<text height-request="5"><label>""</label></text>
+
+			<frame Edit your new ISO (optional)>
+				<hbox homogeneous="true">
+					<checkbox tooltip-text="If ticked, Woofy will pause before creating the sfs file, so you can choose your preferred default apps, as well as GTK, JWM, Openbox, icon and wallpaper themes">
+						<label>Themes & apps</label>
+						<variable>setdefs</variable>
+						<default>false</default>
+					</checkbox>
+					<checkbox tooltip-text="If ticked, Woofy can open initrd.gz, menu.lst or isolinux.cfg, with a help dialog, so you can edit your preferred boot options, before creating your new iso">
+						<label>Boot options</label>
+						<variable>BOOTPARAMS</variable>
+						<default>false</default>
+					</checkbox>
+					<checkbox tooltip-text="If ticked, you will be asked which programs you want to delete from the new SFS filesystem">
+						<label>Delete apps</label>
+						<variable>DELETEAPPS</variable>
+						<default>false</default>
+					</checkbox>
+					<checkbox tooltip-text="If ticked, Woofy will pause before creating the sfs file, so you can edit your Puppy filesystem file before it is created">
+						<label>Filesystem</label>
+						<variable>EDITSFS</variable>
+						<default>false</default>
+					</checkbox>
+				</hbox>
+			</frame>
+
+		</frame>
+		
+		<frame>
+			<hbox>
+				   <button>
+					  <input file stock="gtk-refresh"></input>
+					  <label>Go</label>
+					  <action>remaster_puppy &</action>
+					  <action type="exit">EXIT_NOW</action>
+				   </button>
+				   <button tooltip-text="Click this button for more detailed help on using Woofy">
+					  <input file stock="gtk-help"></input>
+					  <label>Help</label>
+					  <action>$GTKDIALOG --program "HELPGUI" --center &</action>
+				   </button>
+				   <button>
+					  <input file stock="gtk-quit"></input>
+					  <label>Quit</label>
+					  <action type="exit">EXIT_NOW</action>
+				   </button>
+			</hbox>
+		</frame>
+	</vbox>
+
+</window>'
+
+$GTKDIALOG --program WOOFYGUI --center &
+unset "WOOFYGUI"
+
+exit 0
+
+			OLDVERSION='<hbox>
+				<text><label>A list of files to delete (optional):   </label></text>
+				<entry tooltip-text="Choose a file containing a list of the full paths (starts with /) to the files to be deleted from your new ISO. The file should NOT contain empty lines.">
+					<default>"'${DELETE_LIST}'"</default>
+					<variable>DELETE_LIST</variable>
+				</entry>
+				<button>
+					<input file icon="gtk-file"></input>
+					<action type="fileselect">DELETE_LIST</action>
+				</button>
+			</hbox>'

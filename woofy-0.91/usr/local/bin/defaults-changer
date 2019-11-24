@@ -1,0 +1,86 @@
+#!/bin/sh
+
+# defaults-changer
+# usage: defaults-changer [type] command
+#created by sc0ttman, 18/5/2010
+
+# get the values entered
+export TYPE="$1"
+export FILE="$2"
+export newroot="$3"
+
+export VERSION='0.5'
+
+# create command-line usage
+# set command line options
+while [ $# != 0 ]; do
+   I=1
+   while [ $I -le `echo $# | wc -c` ]; do
+     case $1 in
+         -v|--version)echo "Defaults Changer $VERSION"; exit;;
+		 -h|--help)
+echo 'Usage: defaults-changer [browser|etc|wordprocessor] command
+
+Options:
+  audioplayer    Changes the default audio player to "command"
+  browser    Changes the default browser to "command"
+  calendar    Changes the default calendar app to "command"
+  chat    Changes the default chat app to "command"
+  connect    Changes the default net connection app to "command"
+  contact    Changes the default contacts app to "command"
+  draw    Changes the default drawing app to "command"
+  email    Changes the default email app to "command"
+  htmleditor    Changes the default HTML editor to "command"
+  htmlviewer    Changes the default HTML viewer to "command"
+  imageviewer    Changes the default image viewer to "command"
+  mediaplayer    Changes the default media player to "command"
+  musicplayer    Changes the default music player to "command"
+  paint    Changes the default browser paint app to "command"
+  spreadsheet    Changes the default spreadsheet app to "command"
+  texteditor    Changes the default text editor to "command"
+  wordprocessor    Changes the default word processor to "command"
+
+Followed by:
+  command   The FULL path to the application or file that you want to run
+
+Examples:
+  
+  defaults-changer browser /path/to/opera
+  defaults-changer draw "/path/to/gimp"
+  
+More Help:
+  -help    Show this help message'; exit;;
+      esac
+      shift
+      I=$[$I+1]
+   done
+done
+
+## functions
+set -a
+
+change_default () {
+	# replace the old program with the new one
+	echo "#!/bin/sh" > "$newroot/usr/local/bin/default$TYPE" # clear file, add first line only
+	echo "exec $FILE \"\$@\"" >> "$newroot/usr/local/bin/default$TYPE" # add new comand
+	SUCCESS="Default $TYPE changed to $FILE... Bye xxx"
+}
+	
+# check the default*** file exists
+if [ -f "$newroot/usr/local/bin/default$TYPE" ];then
+		change_default "$newroot"
+		# tell user action is complete
+		CHANGED=true
+else # the default*** file given was not found
+	echo "The file '$3/usr/local/bin/default$TYPE' not found."
+	CHANGED=false
+fi
+
+## output the result
+if [ $CHANGED = true ];then
+	echo $SUCCESS
+else
+	echo "Default $TYPE not updated..."
+fi
+echo ""
+exit

@@ -1,0 +1,387 @@
+#!/bin/sh -a
+#simple switcher for whatever WM and back
+#01micko 2010 GPL see /usr/share/doc/legal/
+#Backup /usr/bin/restartwm (and hide it)
+#ver 0.1 #2010-07-11
+#ver 0.3 #2010-07-12
+#ver 0.4 #2010-07-25
+#ver 0.5 #2010-08-01
+#ver 0.6 #2010-10-17
+#ver 0.7 #2010-10-28
+#ver 0.7 #2010-10-31
+#ver 0.10 #2010-11-04
+#ver 0.11 #2010-11-06
+#ver 0.12 #2010-11-06
+#ver 0.13 #2010-11-07
+#ver 0.14 #2010-11-09
+#ver 0.16 #2011-01-03
+#ver 0.17 #2011-06-11
+#ver 0.18 #2012-01-26: added support for e16
+#ver 0.19 #2012-04-12: 120412: added support for e17, plus a kinda chroot, so can apply changes to another filesystem
+#set -x
+
+ver="0.19"
+# use latest gtkdialog
+GTKDIALOG=`which gtkdialog4`
+[ ! "$GTKDIALOG" ] && GTKDIALOG=`which gtkdialog3`
+[ ! "$GTKDIALOG" ] && GTKDIALOG=`which gtkdialog2`
+[ ! "$GTKDIALOG" ] && GTKDIALOG=`which gtkdialog`
+
+#find images for gui
+[ -d "$1" ] && CHROOT="${1%*/}" || CHROOT='' #120412, get dir path, no trailing slash
+
+IMGDIR="${CHROOT}/usr/share/pixmaps"
+CURRENTWM=`cat ${CHROOT}/etc/windowmanager`
+
+#icewm changer 
+ICEWM(){
+	if [ -f ${CHROOT}$HOME/.gtkrc-2.0.bak ];then mv -f ${CHROOT}$HOME/.gtkrc-2.0.bak ${CHROOT}$HOME/.gtkrc-2.0
+    fi
+    echo 'icewm'> ${CHROOT}/tmp/nextwm
+    if [ "${CHROOT}" = '' ];then
+      restartwm icewm
+	  [ "$CURRENTWM" = "openbox" ] && killall fbpanel
+	  [[ "$CURRENTWM" = "startxfce4" || "$CURRENTWM" = "e16" || "$CURRENTWM" = "startfluxbox" || "$CURRENTWM" = "startkde" ]] && killall X
+	else
+	  echo 'icewm' > ${CHROOT}/etc/windowmanager
+	fi
+}
+
+#jwm changer
+JWM(){
+	if [ -f ${CHROOT}$HOME/.gtkrc-2.0.bak ];then mv -f ${CHROOT}$HOME/.gtkrc-2.0.bak ${CHROOT}$HOME/.gtkrc-2.0
+    fi
+    echo 'jwm'> ${CHROOT}/tmp/nextwm
+    rm -f ${CHROOT}/tmp/wmswitcher
+    if [ "${CHROOT}" = '' ];then
+  	  restartwm jwm
+	  [ "$CURRENTWM" = "openbox" ]&& killall fbpanel
+	  [[ "$CURRENTWM" = "startxfce4" || "$CURRENTWM" = "e16" || "$CURRENTWM" = "startfluxbox" || "$CURRENTWM" = "startkde" ]]&& killall X
+	else
+	  echo 'jwm' > ${CHROOT}/etc/windowmanager
+   fi
+}
+
+#xfce4 changer #ditto icewm comment
+XFCE(){
+	if [ -f ${CHROOT}$HOME/.gtkrc-2.0 ];then mv -f ${CHROOT}$HOME/.gtkrc-2.0 ${CHROOT}$HOME/.gtkrc-2.0.bak
+    fi
+    if [ "${CHROOT}" = '' ];then
+	  restartwm startxfce4
+	  [ "$CURRENTWM" = "openbox" ]&& killall fbpanel
+	  [[ "$CURRENTWM" = "startxfce4" || "$CURRENTWM" = "e16" || "$CURRENTWM" = "startfluxbox" || "$CURRENTWM" = "startkde" ]]&& killall X
+	else
+	  echo 'startxfce4' > ${CHROOT}/etc/windowmanager
+	fi
+}
+
+#openbox
+OPENBOX(){
+	if [ -f ${CHROOT}$HOME/.gtkrc-2.0.bak ];then mv -f ${CHROOT}$HOME/.gtkrc-2.0.bak ${CHROOT}$HOME/.gtkrc-2.0
+	fi
+	echo 'openbox'> ${CHROOT}/tmp/nextwm
+    if [ "${CHROOT}" = '' ];then
+	  restartwm openbox
+	  [ "$CURRENTWM" = "openbox" ]&& killall fbpanel
+	  [[ "$CURRENTWM" = "startxfce4" || "$CURRENTWM" = "e16" || "$CURRENTWM" = "startfluxbox" || "$CURRENTWM" = "startkde" ]]&& killall X
+	else
+	  echo 'openbox' > ${CHROOT}/etc/windowmanager
+	fi
+}
+
+#fluxbox
+FLUXBOX(){
+	if [ -f ${CHROOT}$HOME/.gtkrc-2.0.bak ];then mv -f ${CHROOT}$HOME/.gtkrc-2.0.bak   ${CHROOT}$HOME/.gtkrc-2.0
+	fi
+	echo 'startfluxbox'> ${CHROOT}/tmp/nextwm
+    if [ "${CHROOT}" = '' ];then
+	  restartwm startfluxbox
+	  [ "$CURRENTWM" = "openbox" ]&& killall fbpanel
+	  [[ "$CURRENTWM" = "startxfce4" || "$CURRENTWM" = "e16" || "$CURRENTWM" = "startfluxbox" || "$CURRENTWM" = "startkde" ]]&& killall X
+	else
+	  echo 'startfluxbox' > ${CHROOT}/etc/windowmanager
+	fi
+}
+
+#kde	
+KDE(){
+	if [ -f ${CHROOT}$HOME/.gtkrc-2.0 ];then mv -f ${CHROOT}$HOME/.gtkrc-2.0 ${CHROOT}$HOME/.gtkrc-2.0.bak
+	fi
+    if [ "${CHROOT}" = '' ];then
+	  restartwm startkde
+	  [ "$CURRENTWM" = "openbox" ]&& killall fbpanel
+	  [[ "$CURRENTWM" = "startxfce4" || "$CURRENTWM" = "e16" || "$CURRENTWM" = "startfluxbox" || "$CURRENTWM" = "startkde" ]]&& killall X
+	else
+	  echo 'startkde' > ${CHROOT}/etc/windowmanager
+	fi
+}	
+
+#e16 changer
+E16(){
+	if [ -f ${CHROOT}$HOME/.gtkrc-2.0.bak ];then mv -f ${CHROOT}$HOME/.gtkrc-2.0.bak ${CHROOT}$HOME/.gtkrc-2.0
+	fi
+    echo 'e16'> ${CHROOT}/tmp/nextwm
+    rm -f ${CHROOT}/tmp/wmswitcher
+    if [ "${CHROOT}" = '' ];then
+	  restartwm e16
+	  [ "$CURRENTWM" = "openbox" ] && killall fbpanel
+	  [[ "$CURRENTWM" = "startxfce4" || "$CURRENTWM" = "startfluxbox" || "$CURRENTWM" = "startkde" ]]&& killall X
+	else
+	  echo 'e16' > ${CHROOT}/etc/windowmanager
+	fi
+}
+
+#e17 changer
+E17(){
+	if [ -f ${CHROOT}$HOME/.gtkrc-2.0.bak ];then mv -f ${CHROOT}$HOME/.gtkrc-2.0.bak ${CHROOT}$HOME/.gtkrc-2.0
+	fi
+    echo 'e17'> ${CHROOT}/tmp/nextwm
+    rm -f ${CHROOT}/tmp/wmswitcher
+    if [ "${CHROOT}" = '' ];then
+	  restartwm e17
+	  [ "$CURRENTWM" = "openbox" ] && killall fbpanel
+	  [[ "$CURRENTWM" = "startxfce4" || "$CURRENTWM" = "startfluxbox" || "$CURRENTWM" = "startkde" ]]&& killall X
+	else
+	  echo 'e17' > ${CHROOT}/etc/windowmanager
+	fi
+}
+
+#switch function
+SWITCH(){
+	if [ $RADIOBUTTON1 = true ];then JWM
+		elif [ $RADIOBUTTON2 = true ];then ICEWM
+		elif [ $RADIOBUTTON3 = true ];then XFCE
+		elif [ $RADIOBUTTON4 = true ];then OPENBOX
+		elif [ $RADIOBUTTON5 = true ];then FLUXBOX
+		elif [ $RADIOBUTTON6 = true ];then KDE
+		elif [ $RADIOBUTTON7 = true ];then E16
+		elif [ $RADIOBUTTON8 = true ];then E17
+	fi
+}
+
+
+#current window manager and radio button defaults
+case $CURRENTWM in
+jwm) RADIOBUTTON1=true
+RADIOBUTTON2=false
+RADIOBUTTON3=false
+RADIOBUTTON4=false
+RADIOBUTTON5=false
+RADIOBUTTON6=false
+RADIOBUTTON7=false
+RADIOBUTTON8=false
+;;
+icewm*) RADIOBUTTON2=true
+RADIOBUTTON1=false
+RADIOBUTTON3=false
+RADIOBUTTON4=false
+RADIOBUTTON5=false
+RADIOBUTTON6=false
+RADIOBUTTON7=false
+RADIOBUTTON8=false
+;;
+startxfce4*) RADIOBUTTON3=true
+RADIOBUTTON2=false
+RADIOBUTTON1=false
+RADIOBUTTON4=false
+RADIOBUTTON5=false
+RADIOBUTTON6=false
+RADIOBUTTON7=false
+RADIOBUTTON8=false
+;;
+openbox) RADIOBUTTON4=true
+RADIOBUTTON2=false
+RADIOBUTTON3=false
+RADIOBUTTON1=false
+RADIOBUTTON5=false
+RADIOBUTTON6=false
+RADIOBUTTON7=false
+RADIOBUTTON8=false
+;;
+startfluxbox) RADIOBUTTON5=true
+RADIOBUTTON2=false
+RADIOBUTTON3=false
+RADIOBUTTON4=false
+RADIOBUTTON1=false
+RADIOBUTTON6=false
+RADIOBUTTON7=false
+RADIOBUTTON8=false
+;;
+startkde) RADIOBUTTON6=true
+RADIOBUTTON5=false
+RADIOBUTTON2=false
+RADIOBUTTON3=false
+RADIOBUTTON4=false
+RADIOBUTTON1=false
+RADIOBUTTON7=false
+RADIOBUTTON8=false
+;;
+e16*) RADIOBUTTON7=true
+RADIOBUTTON1=false
+RADIOBUTTON2=false
+RADIOBUTTON3=false
+RADIOBUTTON4=false
+RADIOBUTTON5=false
+RADIOBUTTON6=false
+RADIOBUTTON8=false
+;;
+e17*) RADIOBUTTON8=true
+RADIOBUTTON1=false
+RADIOBUTTON2=false
+RADIOBUTTON3=false
+RADIOBUTTON4=false
+RADIOBUTTON5=false
+RADIOBUTTON6=false
+RADIOBUTTON7=false
+;;
+*)echo "woops, unsupported"; exit
+;;
+esac
+
+if [ -d "${CHROOT}" ];then
+  #find window managers in other fs!
+  JWM_IS=`chroot "${CHROOT}" which jwm`
+  ICEWM_IS=`chroot "${CHROOT}" which icewm`
+  XFCE4_IS=`chroot "${CHROOT}" which xfwm4`
+  OPENBOX_IS=`chroot "${CHROOT}" which openbox`
+  FLUXBOX_IS=`chroot "${CHROOT}" which startfluxbox`
+  KDE_IS=`chroot "${CHROOT}" which startkde`
+  E16_IS=`chroot "${CHROOT}" which e16`
+  E17_IS=`chroot "${CHROOT}" which e17`
+else
+  #find window managers!
+  JWM_IS=`which jwm`
+  ICEWM_IS=`which icewm`
+  XFCE4_IS=`which xfwm4`
+  OPENBOX_IS=`which openbox`
+  FLUXBOX_IS=`which startfluxbox`
+  KDE_IS=`which startkde`
+  E16_IS=`which e16`
+  E17_IS=`which e17`
+fi
+#GUI vars
+if [[ "$JWM_IS" != "" ]];then JWMGUI="
+    <radiobutton>
+     <variable>RADIOBUTTON1</variable>
+	 <label>\"JWM\"</label>
+	 <default>$RADIOBUTTON1</default>
+	</radiobutton>
+	<pixmap><input file>$IMGDIR/jwm.png</input></pixmap>
+	"
+fi
+if [[ "$ICEWM_IS" != "" ]];then ICEWMGUI="
+    <radiobutton>
+     <variable>RADIOBUTTON2</variable>
+	 <label>\"IceWM\"</label>
+	 <default>$RADIOBUTTON2</default>
+	</radiobutton>
+	<pixmap><input file>$IMGDIR/icewm-logo.png</input></pixmap>
+	"
+fi
+if [[ "$XFCE4_IS" != "" ]];then XFCEGUI="
+    <radiobutton>
+     <variable>RADIOBUTTON3</variable>
+	 <label>\"Xfce4\"</label>
+	 <default>$RADIOBUTTON3</default>
+	</radiobutton>
+	<pixmap><input file>$IMGDIR/xfce4_xicon3.png</input></pixmap>
+	"
+fi
+if [[ "$OPENBOX_IS" != "" ]];then OPENBOXGUI="
+    <radiobutton>
+     <variable>RADIOBUTTON4</variable>
+	 <label>\"Openbox\"</label>
+	 <default>$RADIOBUTTON4</default>
+	</radiobutton>
+	<pixmap><input file>$IMGDIR/openbox1.png</input></pixmap>
+	"
+fi
+if [[ "$FLUXBOX_IS" != "" ]];then FLUXGUI="
+    <radiobutton>
+     <variable>RADIOBUTTON5</variable>
+	 <label>\"Fluxbox\"</label>
+	 <default>$RADIOBUTTON5</default>
+	</radiobutton>
+	<pixmap><input file>$IMGDIR/fluxbox.png</input></pixmap>
+	"	
+fi
+if [[ "$KDE_IS" != "" ]];then KDEGUI="
+    <radiobutton>
+     <variable>RADIOBUTTON6</variable>
+	 <label>\"Kde\"</label>
+	 <default>$RADIOBUTTON6</default>
+	</radiobutton>
+	<pixmap><input file>$IMGDIR/kde.png</input></pixmap>
+	"	
+fi
+if [[ "$E16_IS" != "" ]];then E16GUI="
+    <radiobutton>
+     <variable>RADIOBUTTON7</variable>
+	 <label>\"E16\"</label>
+	 <default>$RADIOBUTTON7</default>
+	</radiobutton>
+	<pixmap><input file>$IMGDIR/e16.png</input></pixmap>
+	"	
+fi
+if [[ "$E17_IS" != "" ]];then E17GUI="
+    <radiobutton>
+     <variable>RADIOBUTTON8</variable>
+	 <label>\"E17\"</label>
+	 <default>$RADIOBUTTON8</default>
+	</radiobutton>
+	<pixmap><input file>$IMGDIR/e17.png</input></pixmap>
+	"	
+fi
+if [ -d "${CHROOT}" ];then
+  GUI_BUTTON="<button>
+	 <label>Set WM</label>
+     <input file stock=\"gtk-apply\"></input> 
+     <action>SWITCH</action>
+     <action type=\"exit\">EXIT_NOW</action>
+	</button>"
+  GUI_MORE_INFO="<frame Important Information>
+	<text use-markup=\"true\" xalign=\"0\"><label>\"<b>Set WM</b> will make the chosen WM the default\"</label></text>
+	<text use-markup=\"true\"><label>\"<i>This change can be tested when you boot your new filesystem</i>\"</label></text>
+   </frame>"
+else
+  GUI_BUTTON="<button>
+	 <label>Restart X</label>
+     <input file stock=\"gtk-apply\"></input> 
+     <action>SWITCH</action>
+     <action>restartwm</action>
+     <action>EXIT:restartX</action>
+	</button>"
+  GUI_MORE_INFO="<frame Important Information>
+	<text use-markup=\"true\" xalign=\"0\"><label>\"<b>Restart X</b> will switch WMs and restart X now\"</label></text>
+	<text use-markup=\"true\" xalign=\"0\"><label>\"<b>Note:</b><i> Restarting X will kill all your open applications</i>\"</label></text>
+	<text use-markup=\"true\"><label>\"<i>Save your work before you continue</i>\"</label></text>
+   </frame>"
+fi
+
+#GUI
+switcheroo="
+<window title=\"WM Switcher $ver\" resizable=\"false\">
+ <vbox>
+    
+  <frame Choose the window manager you would like to use>
+   <vbox>
+   $JWMGUI
+   $ICEWMGUI
+   $XFCEGUI
+   $OPENBOXGUI
+   $FLUXGUI
+   $KDEGUI
+   $E16GUI
+   $E17GUI
+   </vbox>
+  </frame>
+  ${GUI_MORE_INFO}
+	<hbox homogeneous=\"true\">
+	  ${GUI_BUTTON}
+	</hbox>
+ </vbox>
+</window>"
+$GTKDIALOG -p switcheroo -c
+unset switcheroo
+#END
+exit 0
