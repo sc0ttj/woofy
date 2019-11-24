@@ -54,12 +54,10 @@ Video Demo: http://www.youtube.com/watch?v=cpMk7frOEho
 
 ## Usage
 
-To load `woofy`:
+Use the menu entry, found at `Menu->System->Woofy`.
 
-Type `woofy` in the terminal, then you'll see all the background workings
-in the terminal, as your new SFS file and ISO files are being created.
-
-Or use the menu entry, found at `Menu->System->Woofy`.
+Or type `woofy` in the terminal to see all the logging output, as your new SFS
+file and ISO files are being created.
 
 Once the Woofy UI has loaded:
 
@@ -67,8 +65,8 @@ Once the Woofy UI has loaded:
 2. Choose a name for your new ISO file
 3. Choose a working dir (a linux partition with lots of space, choose /tmp to use your RAM)
 4. Choose a suffix for your sfs file (optional, must not contain spaces)
-5. Add a text file, listing all files to be deleted from the iso (the list must contain full paths)
-6. Choose a package dir, containing the packages you want added (supports pet, sfs, tar.gz, deb, rpm, txz, xz)
+5. Add a text file, listing all files to be deleted from the iso (must contain full paths)
+6. Choose a directory, containing the packages to add (supports pet, sfs, tar.gz, deb, rpm, txz, xz)
 7. Choose to edit defaults apps, themes, sfs and boot options (or not)
 8. Click 'Go', follow the on screen instructions.
 
